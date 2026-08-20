@@ -1,0 +1,976 @@
+"use client";
+
+import React, { useState } from "react";
+import { 
+  Layers,
+  CheckCircle,
+  XCircle,
+  HelpCircle,
+  Sliders,
+  ChevronRight,
+  Info,
+  Maximize2
+} from "lucide-react";
+import { Quiz } from "@/components/Quiz";
+
+export default function PharmacophoreModelingPage() {
+  const [selectedFeatures, setSelectedFeatures] = useState<string[]>(["acceptor", "aromatic", "donor"]);
+  const [tolerance, setTolerance] = useState(1.2); // Radius in Angstroms
+  const [selectedMolecule, setSelectedMolecule] = useState<number>(0);
+  const [screened, setScreened] = useState(false);
+  const [hoveredFeature, setHoveredFeature] = useState<string | null>(null);
+
+  // Pharmacophore definitions and features
+  const featuresList = [
+    { id: "acceptor", name: "Hydrogen Bond Acceptor (HBA)", color: "stroke-red-500 fill-red-50/30 text-red-600 bg-red-50 border-red-200" },
+    { id: "donor", name: "Hydrogen Bond Donor (HBD)", color: "stroke-blue-500 fill-blue-50/30 text-blue-600 bg-blue-50 border-blue-200" },
+    { id: "aromatic", name: "Aromatic Ring Center (AR)", color: "stroke-amber-500 fill-amber-50/30 text-amber-600 bg-amber-50 border-amber-200" },
+  ];
+
+  // Target database of structures with features and coordinates.
+  // Offsets from the query points are deliberately staggered so that the
+  // tolerance slider sweeps three distinct regimes:
+  //   < 1.05 Å  → only the reference matches (the scaffold hop is missed)
+  //   1.05–2.08 Å → reference + scaffold hop match (the useful window)
+  //   ≥ 2.09 Å  → the ortho-substituted decoy is admitted too (false positive)
+  const dbMolecules = [
+    {
+      id: 0,
+      name: "Molecule A (Estradiol Analogue)",
+      scaffold: "Steroidal",
+      features: ["acceptor", "aromatic", "donor"],
+      // Reference ligand: the pharmacophore was derived from this pose, so all
+      // three features sit exactly on the query points (0.00 Å deviation).
+      coords: {
+        aromatic: { x: 125, y: 115 },
+        acceptor: { x: 75, y: 145 },
+        donor: { x: 320, y: 115 }
+      },
+      desc: "An organic compound built on a four-ring steroidal skeleton. The phenolic A-ring acts as the aromatic center and H-bond acceptor, while the cyclopentane D-ring hydroxyl acts as the H-bond donor. This is the reference ligand the pharmacophore was derived from, so every feature sits exactly on its query point.",
+      chemicalFormula: "C₁₈H₂₄O₂",
+      bindingAffinity: "K_d = 0.2 nM",
+    },
+    {
+      id: 1,
+      name: "Molecule B (Diethylstilbestrol)",
+      scaffold: "Stilbene (Non-Steroidal)",
+      features: ["acceptor", "aromatic", "donor"],
+      // Genuine scaffold hop: the phenol pair spans the same distance, but the
+      // stilbene geometry cannot place the second oxygen perfectly — the HBD
+      // lands 1.04 Å from the query point.
+      coords: {
+        aromatic: { x: 125, y: 115 },
+        acceptor: { x: 75, y: 145 },
+        donor: { x: 334, y: 137 }
+      },
+      desc: "A synthetic, non-steroidal estrogen. Despite having no skeletal similarity to a steroid, its two phenolic hydroxyls span nearly the same distance as estradiol's, so it recovers the same pharmacophore on a completely different scaffold — the classic example of scaffold hopping. The overlay is good but not exact: the second phenol lands about 1 Å off the query point, so an over-strict tolerance will discard this true active.",
+      chemicalFormula: "C₁₈H₂₀O₂",
+      bindingAffinity: "K_d = 0.5 nM",
+    },
+    {
+      id: 2,
+      name: "Molecule C (Ortho-Substituted Decoy)",
+      scaffold: "Benzene Derivative",
+      features: ["aromatic", "acceptor", "donor"],
+      // Decoy: right features, wrong vector. The HBD falls 2.09 Å away, so it
+      // is only admitted once the tolerance is pushed past ~2.1 Å.
+      coords: {
+        aromatic: { x: 125, y: 115 },
+        acceptor: { x: 75, y: 145 },
+        donor: { x: 283, y: 152 }
+      },
+      desc: "2-(4-Hydroxybutyl)phenol. It carries all three required feature types — an aromatic ring, a phenolic acceptor, and a hydroxyl donor — but the side chain branches ortho to the phenol rather than across the ring, so the donor vector points the wrong way and the hydroxyl falls about 2.1 Å short of the query point. It is a useful reminder that matching feature types is not the same as matching feature geometry: widen the tolerance far enough and this inactive compound passes.",
+      chemicalFormula: "C₁₀H₁₄O₂",
+      bindingAffinity: "K_d > 10,000 nM (Inactive)",
+    },
+  ];
+
+  const currentMolecule = dbMolecules[selectedMolecule];
+
+  // Distance calculations for the display
+  const getDistance = (p1: { x: number; y: number }, p2: { x: number; y: number }) => {
+    const rawDist = Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+    // Scale pixel distance to Angstroms (e.g. 25 pixels = 1.0 Angstrom)
+    return (rawDist / 25).toFixed(2);
+  };
+
+  // Check if a molecule feature matches based on spatial tolerance
+  // Query center coordinates: AR(125, 115), HBA(75, 145), HBD(320, 115)
+  const queryCoords = {
+    aromatic: { x: 125, y: 115 },
+    acceptor: { x: 75, y: 145 },
+    donor: { x: 320, y: 115 }
+  };
+
+  const checkFeatureMatch = (featureId: "aromatic" | "acceptor" | "donor", mol: typeof dbMolecules[0]) => {
+    if (!selectedFeatures.includes(featureId)) return true; // excluded features match by default
+    if (!mol.features.includes(featureId)) return false;
+    
+    const molPt = mol.coords[featureId];
+    const queryPt = queryCoords[featureId];
+    const rawDist = Math.sqrt(Math.pow(molPt.x - queryPt.x, 2) + Math.pow(molPt.y - queryPt.y, 2));
+    const angstromDist = rawDist / 25;
+    return angstromDist <= tolerance;
+  };
+
+  const isMoleculeMatch = (mol: typeof dbMolecules[0]) => {
+    return (
+      (!selectedFeatures.includes("aromatic") || checkFeatureMatch("aromatic", mol)) &&
+      (!selectedFeatures.includes("acceptor") || checkFeatureMatch("acceptor", mol)) &&
+      (!selectedFeatures.includes("donor") || checkFeatureMatch("donor", mol))
+    );
+  };
+
+  return (
+    <div className="space-y-10">
+      {/* Header */}
+      <div>
+        <h1>Module 7: Pharmacophore Modeling</h1>
+        <p className="lead text-slate-600 max-w-3xl">
+          Learn how to extract the supramolecular electronic and steric footprint required for ligand binding. Explore ligand-based and structure-based techniques, and master the concept of scaffold hopping through an interactive alignment graph.
+        </p>
+      </div>
+
+      {/* Learning outcomes */}
+      <section className="rounded-xl border border-border bg-surface p-5 space-y-2">
+        <h2 className="!mt-0 !text-base font-bold">Learning outcomes</h2>
+        <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1 leading-relaxed">
+          <li>State what a pharmacophore is — and what it is not — using the IUPAC definition.</li>
+          <li>Choose between a ligand-based and a structure-based model from the evidence you actually have.</li>
+          <li>Explain how a pharmacophore enables scaffold hopping where fingerprint similarity fails.</li>
+          <li>Balance feature tolerance against excluded volumes, and say what each one costs you.</li>
+          <li>Validate a model against property-matched decoys and read the resulting metrics honestly.</li>
+        </ul>
+      </section>
+
+      {/* Sections */}
+      <div className="space-y-10">
+        <section className="space-y-4">
+            <h2>1. The IUPAC Blueprint of Molecular Recognition</h2>
+            <div className="bg-surface border border-border rounded-xl p-5 mb-4">
+              <span className="block font-semibold text-xs text-accent uppercase tracking-wider mb-2">IUPAC Definition</span>
+              <p className="italic text-foreground text-base font-serif leading-relaxed">
+                &ldquo;A pharmacophore is the ensemble of steric and electronic features that is necessary to ensure the optimal supramolecular interactions with a specific biological target structure and to trigger (or to block) its biological response.&rdquo;
+              </p>
+              <span className="block text-xs text-slate-500 text-right mt-2 font-bold font-mono">Wermuth, Ganellin, Lindberg &amp; Mitscher, <span className="not-italic">Pure Appl. Chem.</span> <strong>70</strong>(5), 1129–1143 (1998)</span>
+            </div>
+            <p>
+              In computer-aided drug design, a pharmacophore is <strong>not a chemical structure</strong> or a collection of atoms. Instead, it is an abstract skeleton of molecular recognition points. While a chemist looks at a molecule as rings, double bonds, and chains, a biological receptor experiences it as a spatial distribution of electrostatic potentials, hydrogen-bond directional vectors, and hydrophobic surfaces.
+            </p>
+            <p>
+              By translating physical structures into abstract pharmacophoric features, computational chemists can screen billions of compounds without running full docking simulations, focusing solely on whether the key functional features are placed at the exact 3D coordinates required for binding.
+            </p>
+        </section>
+
+        <section className="space-y-4">
+            <h2>2. Ligand-Based vs. Structure-Based Pharmacophores</h2>
+            <p>
+              Depending on the availability of biological data, pharmacophore modeling follows one of two distinct methodologies:
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 my-2 not-prose">
+              <div className="border border-border rounded-xl p-5 bg-white shadow-sm space-y-2">
+                <span className="inline-block px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 font-semibold text-[10px] uppercase">Ligand-Based Models</span>
+                <p className="text-sm text-foreground font-bold">Generating consensus hypotheses from active molecules</p>
+                <p className="text-sm leading-relaxed text-slate-800">
+                  Used when the target receptor's 3D structure is unknown (e.g. orphan GPCRs). Multiple active ligands are aligned in 3D space to identify overlapping functional properties. The common points that match distance matrices across all active conformations form a consensus pharmacophore.
+                </p>
+              </div>
+              <div className="border border-border rounded-xl p-5 bg-white shadow-sm space-y-2">
+                <span className="inline-block px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 font-semibold text-[10px] uppercase">Structure-Based Models</span>
+                <p className="text-sm text-foreground font-bold">Mapping protein pockets directly</p>
+                <p className="text-sm leading-relaxed text-slate-800">
+                  Derived directly from the 3D crystal structure of the receptor. Computational grids scan the binding pocket, mapping H-bond donors on the protein to H-bond acceptor features in the model, acidic residues to positive ionizable features, and hydrophobic crevices to hydrophobic features.
+                </p>
+              </div>
+            </div>
+        </section>
+
+        <section className="space-y-4">
+            <h2>3. Scaffold Hopping: Breaking Structural Constraints</h2>
+            <p>
+              One of the most powerful applications of pharmacophores is <strong>scaffold hopping</strong>: the identification of structurally novel active compounds that possess completely different core architectures (scaffolds) from the starting molecules.
+            </p>
+            <p>
+              Standard chemical searches rely on topological similarity (e.g. the Tanimoto coefficient over molecular fingerprints, Module 5), which will fail to find active molecules of another class. Pharmacophores bypass this restriction by prioritizing <strong>supramolecular function over structural topology</strong>. This is exactly why a pharmacophore query earns its place as an early filter in a screening cascade (Module 8): it is cheap enough to run over millions of compounds, and unlike a fingerprint search it can retrieve chemotypes that share no scaffold with the reference.
+            </p>
+            <div className="border-l-2 border-accent pl-4 italic bg-accent/5 p-4 rounded-r-xl my-2 text-sm">
+              <strong className="text-foreground block not-italic mb-1">Biological Equivalence:</strong>
+              If Molecule A (steroidal core) and Molecule B (flexible alkyl core) present H-bond donor, acceptor, and aromatic groups at the same 3D spatial distances, they will trigger the same biological response at the receptor pocket, despite looking completely unrelated on paper.
+            </div>
+            <p className="text-sm text-slate-700">
+              The playground below is exactly this experiment: Molecule A is a steroid, Molecule B is a stilbene, and they share no scaffold at all — yet both satisfy the same three feature points.
+            </p>
+        </section>
+
+        <section className="space-y-4">
+            <h2>4. Computational PDB-to-3D Pharmacophore Pipeline</h2>
+            <p>
+              When multiple crystal structures of a target protein bound to different ligands are available in the PDB, computational chemists run a 5-stage Python pipeline using open-source packages to extract an actionable consensus pharmacophore:
+            </p>
+            <div className="space-y-3.5 not-prose">
+              <div className="flex gap-3.5 p-4 border border-border bg-white rounded-xl">
+                <span className="h-6 w-6 font-mono font-bold text-xs bg-slate-100 border border-slate-200 rounded flex items-center justify-center flex-shrink-0 text-slate-800">1</span>
+                <div>
+                  <h4 className="font-bold text-sm text-slate-900">Database Mining (Biotite & RCSB API)</h4>
+                  <p className="text-xs text-slate-800 mt-1 leading-relaxed">
+                    Uses RCSB GraphQL queries to retrieve structures bound to active ligands with strict filters: resolved via X-ray crystallography, resolution ≤ 3.0 Å, and drug-like ligand size &gt; 100 Da.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-3.5 p-4 border border-border bg-white rounded-xl">
+                <span className="h-6 w-6 font-mono font-bold text-xs bg-slate-100 border border-slate-200 rounded flex items-center justify-center flex-shrink-0 text-slate-800">2</span>
+                <div>
+                  <h4 className="font-bold text-sm text-slate-900">Pocket Superposition (MDAnalysis)</h4>
+                  <p className="text-xs text-slate-800 mt-1 leading-relaxed">
+                    As structures exist in different crystallographic frames, the pipeline superposes all protein backbones (C-alpha atoms) onto a high-resolution template. This drags the co-crystallized ligands into a common 3D coordinate space inside the pocket.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-3.5 p-4 border border-border bg-white rounded-xl">
+                <span className="h-6 w-6 font-mono font-bold text-xs bg-slate-100 border border-slate-200 rounded flex items-center justify-center flex-shrink-0 text-slate-800">3</span>
+                <div>
+                  <h4 className="font-bold text-sm text-slate-900">Spatial Pocket Clustering (scikit-learn DBSCAN)</h4>
+                  <p className="text-xs text-slate-800 mt-1 leading-relaxed">
+                    Runs DBSCAN (Density-Based Spatial Clustering of Applications with Noise) on all aligned ligand atoms. This separates orthosteric binding groups from allosteric pockets and discards random solvent outliers.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-3.5 p-4 border border-border bg-white rounded-xl">
+                <span className="h-6 w-6 font-mono font-bold text-xs bg-slate-100 border border-slate-200 rounded flex items-center justify-center flex-shrink-0 text-slate-800">4</span>
+                <div>
+                  <h4 className="font-bold text-sm text-slate-900">Bond Correction & Feature Tagging (RDKit)</h4>
+                  <p className="text-xs text-slate-800 mt-1 leading-relaxed">
+                    PDB files do not store bond orders. The pipeline matches co-crystallized coords to 2D SMILES templates to correct bond orders. RDKit's Feature Factory then tags features (HB donors/acceptors, aromatics, hydrophobes) with their exact 3D coordinates.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-3.5 p-4 border border-border bg-white rounded-xl">
+                <span className="h-6 w-6 font-mono font-bold text-xs bg-slate-100 border border-slate-200 rounded flex items-center justify-center flex-shrink-0 text-slate-800">5</span>
+                <div>
+                  <h4 className="font-bold text-sm text-slate-900">Consensus Extraction (k-means)</h4>
+                  <p className="text-xs text-slate-800 mt-1 leading-relaxed">
+                    Groups coordinates of matching features (e.g. all HB donors) and clusters them using k-means. Centroids matching at least 50% of the active ligands are kept as a consensus blueprint for virtual screening.
+                  </p>
+                </div>
+              </div>
+            </div>
+        </section>
+      </div>
+
+      {/* Interactive Section */}
+      <section className="widget-container">
+        <div className="p-5 border-b border-border bg-surface flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <Layers className="text-accent h-5 w-5" />
+              <h3 className="font-bold text-foreground text-base">Interactive Graph: 3D-to-2D Pharmacophore Alignment</h3>
+            </div>
+            <p className="text-sm text-slate-800 font-medium">
+              Select a compound to project its functional group coordinates onto the pharmacophore query, then sweep the tolerance to see how it trades sensitivity against selectivity. Below ~1.0 Å you lose the scaffold hop (Molecule B); above ~2.1 Å you start admitting the inactive decoy (Molecule C).
+            </p>
+          </div>
+          
+          <div className="flex gap-2">
+            {dbMolecules.map((m) => (
+              <button
+                key={m.id}
+                onClick={() => {
+                  setSelectedMolecule(m.id);
+                  setScreened(false);
+                }}
+                className={`px-3 py-1.5 rounded-lg border text-sm font-semibold transition-all ${
+                  selectedMolecule === m.id
+                    ? "bg-accent border-accent text-white shadow-sm"
+                    : "bg-white border-border text-slate-800 hover:text-slate-900 hover:bg-surface"
+                }`}
+              >
+                {m.name.split(" (")[0]}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 text-sm">
+          
+          {/* Left panel: Controls & Alignment Metrics */}
+          <div className="lg:col-span-4 p-5 border-r border-border space-y-6 flex flex-col justify-between">
+            <div className="space-y-5">
+              <div>
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-800 block mb-2">1. Query Features</span>
+                <div className="space-y-2">
+                  {featuresList.map((f) => (
+                    <label 
+                      key={f.id} 
+                      className={`flex items-center gap-3 p-2.5 rounded-lg border text-sm cursor-pointer select-none transition-colors ${
+                      selectedFeatures.includes(f.id)
+                        ? "bg-surface border-border text-foreground font-semibold"
+                        : "border-transparent text-slate-800 opacity-70 hover:opacity-100"
+                    }`}
+                onMouseEnter={() => setHoveredFeature(f.id)}
+                onMouseLeave={() => setHoveredFeature(null)}
+              >
+                <input
+                  type="checkbox"
+                  checked={selectedFeatures.includes(f.id)}
+                  onChange={() => {
+                    if (selectedFeatures.includes(f.id)) {
+                      setSelectedFeatures(selectedFeatures.filter((x) => x !== f.id));
+                    } else {
+                      setSelectedFeatures([...selectedFeatures, f.id]);
+                    }
+                    setScreened(false);
+                  }}
+                  className="rounded border-border text-accent focus:ring-accent"
+                />
+                <span className={`inline-block px-1.5 py-0.5 rounded text-xs border`}>
+                  {f.id === "acceptor" ? "HBA" : f.id === "donor" ? "HBD" : "AR"}
+                </span>
+                <span>{f.name.split(" (")[0]}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {/* Slider for Spatial Tolerance */}
+        <div className="space-y-2">
+          <div className="flex justify-between items-center text-sm text-slate-800 font-bold">
+            <span className="font-semibold text-foreground">2. Spatial Tolerance (Radius)</span>
+            <span className="font-bold text-foreground bg-surface border border-border px-2 py-0.5 rounded font-mono text-xs">
+              {tolerance.toFixed(2)} Å
+            </span>
+          </div>
+          <input
+            type="range"
+            min="0.5"
+            max="2.5"
+            step="0.1"
+            value={tolerance}
+            onChange={(e) => {
+              setTolerance(parseFloat(e.target.value));
+              setScreened(false);
+            }}
+            className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-accent"
+          />
+          <div className="flex justify-between text-sm text-slate-800 font-bold font-mono">
+            <span>0.5 Å (Strict)</span>
+            <span>2.5 Å (Permissive)</span>
+          </div>
+        </div>
+            </div>
+
+            {/* Match Validation Status */}
+            <div className="space-y-3 pt-4 border-t border-border">
+              <button
+                onClick={() => setScreened(true)}
+                className="w-full py-2.5 rounded-lg bg-accent text-white font-semibold text-sm transition-colors hover:bg-accent-dark shadow-sm flex items-center justify-center gap-1.5"
+              >
+                Validate Pharmacophore Fit
+              </button>
+
+              {screened && (
+                <div className={`p-4 rounded-xl border flex gap-3 items-start animate-fade-in ${
+                  isMoleculeMatch(currentMolecule)
+                    ? "bg-emerald-50/50 border-emerald-200 text-emerald-800"
+                    : "bg-rose-50/50 border-rose-200 text-rose-800"
+                }`}>
+                  <div className="mt-0.5">
+                    {isMoleculeMatch(currentMolecule) ? (
+                      <CheckCircle className="h-5 w-5 text-emerald-600" />
+                    ) : (
+                      <XCircle className="h-5 w-5 text-rose-600" />
+                    )}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <h5 className="font-bold text-sm text-foreground">
+                      {isMoleculeMatch(currentMolecule) ? "Supramolecular Match!" : "Validation Failed"}
+                    </h5>
+                    <p className="text-xs font-semibold leading-relaxed mt-1 opacity-90">
+                      {isMoleculeMatch(currentMolecule)
+                        ? `${currentMolecule.name} satisfies all active distance constraints within the ${tolerance}Å tolerance boundaries.`
+                        : `${currentMolecule.name} does not align. One or more active features lie outside the tolerance sphere coordinates.`}
+                    </p>
+                    <div className="mt-2 pt-2 border-t border-current/20 space-y-1">
+                      {selectedFeatures.map((featureId) => {
+                        const fId = featureId as "aromatic" | "acceptor" | "donor";
+                        const hasFeat = currentMolecule.features.includes(featureId);
+                        const dist = hasFeat
+                          ? Math.sqrt(
+                              Math.pow(currentMolecule.coords[fId].x - queryCoords[fId].x, 2) +
+                              Math.pow(currentMolecule.coords[fId].y - queryCoords[fId].y, 2)
+                            ) / 25
+                          : null;
+                        const matches = checkFeatureMatch(fId, currentMolecule);
+                        const label = fId === "acceptor" ? "HBA" : fId === "donor" ? "HBD" : "AR";
+                        return (
+                          <div key={featureId} className="flex items-center justify-between text-xs font-mono gap-2">
+                            <div className="flex items-center gap-1">
+                              {matches
+                                ? <CheckCircle className="h-3 w-3 text-emerald-600 flex-shrink-0" />
+                                : <XCircle className="h-3 w-3 text-rose-600 flex-shrink-0" />}
+                              <span className="font-bold">{label}</span>
+                            </div>
+                            <span className={matches ? "text-emerald-700" : "text-rose-700"}>
+                              {hasFeat
+                                ? `${dist!.toFixed(2)} Å ${matches ? "≤" : ">"} ${tolerance.toFixed(1)} Å`
+                                : "feature absent"}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Right panel: SVG Canvas */}
+          <div className="lg:col-span-8 p-5 flex flex-col justify-between bg-surface/30 min-h-[360px] relative">
+            
+            {/* Absolute badge overlay */}
+            <div className="absolute top-4 left-4 z-10 space-y-1">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-800 block">Selected Conformational Projection</span>
+              <span className="inline-block px-2.5 py-0.5 rounded-md bg-white border border-border font-mono text-xs font-semibold">
+                Core: {currentMolecule.scaffold}
+              </span>
+            </div>
+
+            {/* Molecule details drawer */}
+            <div className="absolute top-4 right-4 z-10 hidden sm:block">
+              <div className="bg-white/80 backdrop-blur border border-border rounded-lg p-2.5 max-w-[200px] text-xs space-y-1 shadow-sm">
+                <div className="flex justify-between font-bold text-foreground">
+                  <span className="truncate pr-2">{currentMolecule.name.split(" (")[0]}</span>
+                  <span className="text-accent">{currentMolecule.chemicalFormula}</span>
+                </div>
+                <div className="text-xs text-slate-800 border-t border-border pt-1">
+                  Affinity: <span className="font-semibold text-foreground">{currentMolecule.bindingAffinity}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* SVG Visual Canvas */}
+            <div className="flex-1 flex items-center justify-center p-2">
+              <svg 
+                role="img"
+                aria-label="Pharmacophore alignment canvas: the skeleton of the selected molecule overlaid on the aromatic, acceptor and donor query points, each drawn with its tolerance sphere."
+                viewBox="0 0 400 300" 
+                className="w-full max-w-[420px] aspect-[4/3] bg-white rounded-xl border border-border shadow-inner"
+              >
+                {/* Distance Dimension Lines in background */}
+                {selectedFeatures.includes("aromatic") && selectedFeatures.includes("acceptor") && (
+                  <g className="opacity-60">
+                    <line x1="125" y1="115" x2="75" y2="145" className="stroke-slate-600 dark:stroke-slate-400" strokeWidth="1" strokeDasharray="3,3" />
+                    <text x="100" y="125" className="fill-slate-700 text-xs font-mono font-bold dark:fill-slate-200" textAnchor="middle">
+                      {getDistance(queryCoords.aromatic, queryCoords.acceptor)} Å
+                    </text>
+                  </g>
+                )}
+                {selectedFeatures.includes("aromatic") && selectedFeatures.includes("donor") && (
+                  <g className="opacity-60">
+                    <line x1="125" y1="115" x2="320" y2="115" className="stroke-slate-600 dark:stroke-slate-400" strokeWidth="1" strokeDasharray="3,3" />
+                    <text x="222" y="105" className="fill-slate-700 text-xs font-mono font-bold dark:fill-slate-200" textAnchor="middle">
+                      {getDistance(queryCoords.aromatic, queryCoords.donor)} Å
+                    </text>
+                  </g>
+                )}
+                {selectedFeatures.includes("acceptor") && selectedFeatures.includes("donor") && (
+                  <g className="opacity-60">
+                    <line x1="75" y1="145" x2="320" y2="115" className="stroke-slate-600 dark:stroke-slate-400" strokeWidth="1" strokeDasharray="3,3" />
+                    <text x="197" y="142" className="fill-slate-700 text-xs font-mono font-bold dark:fill-slate-200" textAnchor="middle">
+                      {getDistance(queryCoords.acceptor, queryCoords.donor)} Å
+                    </text>
+                  </g>
+                )}
+
+                {/* Candidate Molecule Skeleton Overlay */}
+                <g className="transition-all duration-300">
+
+                  {/* Molecule A — Estradiol Analogue (4-ring steroidal backbone) */}
+                  {selectedMolecule === 0 && (
+                    <g strokeLinecap="round" strokeLinejoin="round">
+                      {/* A-ring: phenol aromatic ring. Vertices:
+                          C1=(150,130) C2=(125,145) C3=(100,130) C4=(100,100) C5=(125,85) C6=(150,100)
+                          Center ≈ (125, 115). C3 = bottom-left vertex (100,130) bears the phenol –OH. */}
+                      <polygon points="150,100 125,85 100,100 100,130 125,145 150,130"
+                               stroke="#64748b" strokeWidth="2" fill="#fef9c3" fillOpacity="0.5" />
+                      {/* Inscribed dashed circle = aromatic delocalization */}
+                      <circle cx="125" cy="115" r="10"
+                              stroke="#a16207" strokeWidth="1" fill="none" strokeDasharray="3,2" />
+                      {/* B-ring (cyclohexane) */}
+                      <polygon points="150,130 175,145 200,130 200,100 175,85 150,100"
+                               stroke="#94a3b8" strokeWidth="2" fill="none" />
+                      {/* C-ring (cyclohexane) */}
+                      <polygon points="200,130 225,145 250,130 250,100 225,85 200,100"
+                               stroke="#94a3b8" strokeWidth="2" fill="none" />
+                      {/* D-ring (cyclopentane) */}
+                      <polygon points="250,130 280,135 295,115 280,95 250,100"
+                               stroke="#94a3b8" strokeWidth="2" fill="none" />
+
+                      {/* C18 Angular Methyl group (typical for steroids) at C13 (C/D junction) */}
+                      <line x1="250" y1="100" x2="250" y2="75" stroke="#94a3b8" strokeWidth="2" />
+
+                      {/* C3 carbon atom — vertex where phenolic –OH is attached */}
+                      <circle cx="100" cy="130" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* C3–O bond (HBA: phenolic oxygen) */}
+                      <line x1="100" y1="130" x2="75" y2="145" stroke="#ef4444" strokeWidth="2.5" />
+                      {/* Oxygen atom circle + label */}
+                      <circle cx="75" cy="145" r="8" fill="#fee2e2" stroke="#ef4444" strokeWidth="1.5" />
+                      <text x="75" y="149" textAnchor="middle" fill="#dc2626"
+                            fontSize="9" fontWeight="bold" fontFamily="sans-serif">OH</text>
+
+                      {/* C17 carbon atom — vertex on D-ring where aliphatic –OH is attached */}
+                      <circle cx="295" cy="115" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* C17–O bond (HBD: aliphatic hydroxyl) */}
+                      <line x1="295" y1="115" x2="320" y2="115" stroke="#3b82f6" strokeWidth="2.5" />
+                      {/* Oxygen atom circle + label */}
+                      <circle cx="320" cy="115" r="8" fill="#dbeafe" stroke="#3b82f6" strokeWidth="1.5" />
+                      <text x="320" y="119" textAnchor="middle" fill="#1d4ed8"
+                            fontSize="9" fontWeight="bold" fontFamily="sans-serif">OH</text>
+                    </g>
+                  )}
+
+                  {/* Molecule B — Diethylstilbestrol (DES, non-steroidal stilbene) */}
+                  {selectedMolecule === 1 && (
+                    <g strokeLinecap="round" strokeLinejoin="round">
+                      {/* Left phenol ring. Identical to Molecule A's A-ring for perfect alignment. */}
+                      <polygon points="150,100 125,85 100,100 100,130 125,145 150,130"
+                               stroke="#64748b" strokeWidth="2" fill="#fef9c3" fillOpacity="0.5" />
+                      <circle cx="125" cy="115" r="10"
+                              stroke="#a16207" strokeWidth="1" fill="none" strokeDasharray="3,2" />
+
+                      {/* C3 carbon atom — where left phenol –OH attaches */}
+                      <circle cx="100" cy="130" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* C3–O bond (HBA phenolic oxygen) */}
+                      <line x1="100" y1="130" x2="75" y2="145" stroke="#ef4444" strokeWidth="2.5" />
+                      <circle cx="75" cy="145" r="8" fill="#fee2e2" stroke="#ef4444" strokeWidth="1.5" />
+                      <text x="75" y="149" textAnchor="middle" fill="#dc2626"
+                            fontSize="9" fontWeight="bold" fontFamily="sans-serif">OH</text>
+
+                      {/* C1 carbon atom — para vertex connecting to central (E)-alkene */}
+                      <circle cx="150" cy="100" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* Central (E)-C(Et)=C(Et)- linkage with accurate zig-zag trans geometry */}
+                      {/* C1 → C_a */}
+                      <line x1="150" y1="100" x2="185" y2="120" stroke="#94a3b8" strokeWidth="2" />
+                      {/* Ethyl branch at C_a (CH2-CH3) pointing downward */}
+                      <line x1="185" y1="120" x2="185" y2="145" stroke="#94a3b8" strokeWidth="2" />
+                      <line x1="185" y1="145" x2="205" y2="157" stroke="#94a3b8" strokeWidth="2" />
+
+                      {/* C_a=C_b double bond */}
+                      <line x1="185" y1="120" x2="215" y2="95" stroke="#64748b" strokeWidth="2.5" />
+                      <line x1="190" y1="126" x2="220" y2="101" stroke="#94a3b8" strokeWidth="1.5" />
+
+                      {/* Ethyl branch at C_b (CH2-CH3) pointing upward */}
+                      <line x1="215" y1="95" x2="215" y2="70" stroke="#94a3b8" strokeWidth="2" />
+                      <line x1="215" y1="70" x2="195" y2="58" stroke="#94a3b8" strokeWidth="2" />
+
+                      {/* C_b → right ring top-left vertex (C1') */}
+                      <line x1="215" y1="95" x2="254" y2="100" stroke="#94a3b8" strokeWidth="2" />
+
+                      {/* Right phenol ring — point-top orientation matching left ring.
+                          Center=(280,115). C1'=(254,100) top-left, connects from chain.
+                          C4'=(306,130) bottom-right, bears phenol –OH (para to C1'). */}
+                      <polygon points="280,85 306,100 306,130 280,145 254,130 254,100"
+                               stroke="#64748b" strokeWidth="2" fill="#fef9c3" fillOpacity="0.5" />
+                      <circle cx="280" cy="115" r="10"
+                              stroke="#a16207" strokeWidth="1" fill="none" strokeDasharray="3,2" />
+
+                      {/* C1' carbon atom — connects to chain */}
+                      <circle cx="254" cy="100" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* C4' carbon atom — where right phenol –OH attaches */}
+                      <circle cx="306" cy="130" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* C4'–O bond (HBD: right phenolic oxygen).
+                          Lands at (334,137) — 1.04 Å from the query point at (320,115),
+                          so the scaffold hop only passes once tolerance ≥ 1.1 Å. */}
+                      <line x1="306" y1="130" x2="334" y2="137" stroke="#3b82f6" strokeWidth="2.5" />
+                      <circle cx="334" cy="137" r="8" fill="#dbeafe" stroke="#3b82f6" strokeWidth="1.5" />
+                      <text x="334" y="141" textAnchor="middle" fill="#1d4ed8"
+                            fontSize="9" fontWeight="bold" fontFamily="sans-serif">OH</text>
+                    </g>
+                  )}
+
+                  {/* Molecule C — 2-(4-hydroxybutyl)phenol decoy (HBD vector points the wrong way) */}
+                  {selectedMolecule === 2 && (
+                    <g strokeLinecap="round" strokeLinejoin="round">
+                      {/* Benzene ring. Vertices identical to Mol A A-ring. */}
+                      <polygon points="150,100 125,85 100,100 100,130 125,145 150,130"
+                               stroke="#64748b" strokeWidth="2" fill="#fef9c3" fillOpacity="0.5" />
+                      <circle cx="125" cy="115" r="10"
+                              stroke="#a16207" strokeWidth="1" fill="none" strokeDasharray="3,2" />
+
+                      {/* C3 carbon atom — bearing matching HBA oxygen */}
+                      <circle cx="100" cy="130" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* C3–O bond (HBA: matches pharmacophore query) */}
+                      <line x1="100" y1="130" x2="75" y2="145" stroke="#ef4444" strokeWidth="2.5" />
+                      <circle cx="75" cy="145" r="8" fill="#fee2e2" stroke="#ef4444" strokeWidth="1.5" />
+                      <text x="75" y="149" textAnchor="middle" fill="#dc2626"
+                            fontSize="9" fontWeight="bold" fontFamily="sans-serif">OH</text>
+
+                      {/* C2 carbon atom — chain branches ortho to the phenol, not across the ring */}
+                      <circle cx="125" cy="145" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* Aliphatic side chain — 4-carbon zig-zag gives C₁₀ total (6 ring + 4 chain) */}
+                      <line x1="125" y1="145" x2="158" y2="168" stroke="#94a3b8" strokeWidth="2" />
+                      <line x1="158" y1="168" x2="193" y2="151" stroke="#94a3b8" strokeWidth="2" />
+                      <line x1="193" y1="151" x2="228" y2="172" stroke="#94a3b8" strokeWidth="2" />
+                      <line x1="228" y1="172" x2="255" y2="157" stroke="#94a3b8" strokeWidth="2" />
+
+                      {/* Terminal carbon bearing the hydroxyl */}
+                      <circle cx="255" cy="157" r="4.5" fill="#475569" stroke="white" strokeWidth="1.5" />
+
+                      {/* C–O bond to the HBD oxygen at (283,152) — 2.09 Å from the query
+                          point at (320,115), so this decoy is only admitted at tolerance ≥ 2.1 Å. */}
+                      <line x1="255" y1="157" x2="283" y2="152" stroke="#3b82f6" strokeWidth="2.5" />
+                      <circle cx="283" cy="152" r="8" fill="#dbeafe" stroke="#3b82f6" strokeWidth="1.5" />
+                      <text x="283" y="156" textAnchor="middle" fill="#1d4ed8"
+                            fontSize="9" fontWeight="bold" fontFamily="sans-serif">OH</text>
+
+                      {/* Dashed red indicator pointing toward correct HBD position (320,115) */}
+                      <line x1="291" y1="149" x2="309" y2="128" stroke="#f87171"
+                            strokeDasharray="3,2" strokeWidth="1.5" />
+                      <text x="316" y="126" fill="#dc2626" fontSize="10" fontWeight="bold"
+                            fontFamily="sans-serif">✗</text>
+                    </g>
+                  )}
+                </g>
+
+                {/* Target Pharmacophore Tolerances (Query Points) */}
+                {selectedFeatures.includes("aromatic") && (
+                  <g className="transition-all duration-300">
+                    <circle 
+                      cx="125" 
+                      cy="115" 
+                      r={tolerance * 25} 
+                      className={`stroke-amber-500 fill-amber-100/20 transition-all ${
+                        hoveredFeature === "aromatic" ? "stroke-2" : "stroke-[1.5]"
+                      }`}
+                      strokeDasharray="4,2" 
+                    />
+                    <circle cx="125" cy="115" r="8" className="fill-amber-500 stroke-white stroke-2" />
+                    <text x="125" y={115 - tolerance * 25 - 8} className="text-xs font-bold fill-amber-800 text-center" textAnchor="middle">AR Center</text>
+                  </g>
+                )}
+
+                {selectedFeatures.includes("acceptor") && (
+                  <g className="transition-all duration-300">
+                    <circle 
+                      cx="75" 
+                      cy="145" 
+                      r={tolerance * 25} 
+                      className={`stroke-red-500 fill-red-100/20 transition-all ${
+                        hoveredFeature === "acceptor" ? "stroke-2" : "stroke-[1.5]"
+                      }`}
+                      strokeDasharray="4,2" 
+                    />
+                    <circle cx="75" cy="145" r="8" className="fill-red-500 stroke-white stroke-2" />
+                    <text x="75" y={145 + tolerance * 25 + 14} className="text-xs font-bold fill-red-800 text-center" textAnchor="middle">HBA Center</text>
+                  </g>
+                )}
+
+                {selectedFeatures.includes("donor") && (
+                  <g className="transition-all duration-300">
+                    <circle 
+                      cx="320" 
+                      cy="115" 
+                      r={tolerance * 25} 
+                      className={`stroke-blue-500 fill-blue-100/20 transition-all ${
+                        hoveredFeature === "donor" ? "stroke-2" : "stroke-[1.5]"
+                      }`}
+                      strokeDasharray="4,2" 
+                    />
+                    <circle cx="320" cy="115" r="8" className="fill-blue-500 stroke-white stroke-2" />
+                    <text x="320" y={115 - tolerance * 25 - 8} className="text-xs font-bold fill-blue-800 text-center" textAnchor="middle">HBD Center</text>
+                  </g>
+                )}
+              </svg>
+            </div>
+
+            {/* Bottom details description */}
+            <div className="bg-white border border-border rounded-xl p-4 mt-4 text-sm text-foreground leading-relaxed shadow-sm">
+              <span className="font-bold text-foreground block mb-1">Backbone Conformation Analysis:</span>
+              <p className="text-slate-900 font-medium mt-1 leading-relaxed">{currentMolecule.desc}</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="space-y-4">
+        <h2>5. Common Pharmacophoric Feature Types</h2>
+        <p>
+          Modern screening tools use seven canonical features to capture ligand-receptor binding properties. Below is their biophysical classification:
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 not-prose">
+          <div className="border border-border p-4 rounded-xl space-y-2 bg-white">
+            <h4 className="font-bold text-foreground text-sm flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-red-500" />
+              Hydrogen Bond Acceptor (HBA)
+            </h4>
+            <p className="text-slate-900 leading-relaxed text-sm">
+              Electronegative atoms (like nitrogen or oxygen) containing lone pairs that attract electron-deficient hydrogen atoms from the receptor. e.g. carbonyls, ethers, tertiary amines.
+            </p>
+          </div>
+          <div className="border border-border p-4 rounded-xl space-y-2 bg-white">
+            <h4 className="font-bold text-foreground text-sm flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-blue-500" />
+              Hydrogen Bond Donor (HBD)
+            </h4>
+            <p className="text-slate-900 leading-relaxed text-sm">
+              Hydrogen atoms attached to highly electronegative elements (like nitrogen, oxygen, or fluorine) that interact with lone pairs. e.g. hydroxyls, primary/secondary amines.
+            </p>
+          </div>
+          <div className="border border-border p-4 rounded-xl space-y-2 bg-white">
+            <h4 className="font-bold text-foreground text-sm flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-amber-500" />
+              Aromatic Ring (AR)
+            </h4>
+            <p className="text-slate-900 leading-relaxed text-sm">
+              Planar ring systems capable of forming stacking interactions (pi-pi staking) with phenylalanine, tyrosine, or tryptophan residues in the receptor.
+            </p>
+          </div>
+          <div className="border border-border p-4 rounded-xl space-y-2 bg-white">
+            <h4 className="font-bold text-foreground text-sm flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-emerald-500" />
+              Hydrophobic Center (HY)
+            </h4>
+            <p className="text-slate-900 leading-relaxed text-sm">
+              Aliphatic chains or carbon networks that partition into hydrophobic protein cavities to drive target affinity via favorable entropy release. e.g. t-butyl, isopropyl groups.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Excluded volumes */}
+      <section className="space-y-4 border-t border-border pt-8">
+        <h2>6. Excluded Volumes: Encoding Where a Ligand May <em>Not</em> Go</h2>
+        <p>
+          Everything so far describes features a molecule must <strong>have</strong>. That is only half a pharmacophore, and on its own it is dangerously permissive: a query made purely of required features will happily match an enormous molecule that satisfies every point and also occupies the space where the protein backbone sits.
+        </p>
+        <p>
+          <strong>Excluded volumes</strong> are spheres marking regions the receptor already fills. A candidate is rejected if any of its heavy atoms falls inside one. They convert the query from a shopping list of chemistry into a genuine shape constraint, and they are the single most effective way to raise the specificity of a structure-based pharmacophore.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 not-prose">
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">Where they come from</h4>
+            <p className="text-sm text-slate-800 leading-relaxed font-medium">
+              In a structure-based model, place them on the receptor atoms lining the pocket — this is essentially free, since you already have the protein. In a ligand-based model you have no receptor, so they are inferred instead: regions that <em>inactive</em> compounds occupy but actives never do are the best available evidence of where the protein is.
+            </p>
+          </div>
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">The tuning problem</h4>
+            <p className="text-sm text-slate-800 leading-relaxed font-medium">
+              Excluded volumes carry the same trade-off as feature tolerance, in the opposite direction. Too few, or too small, and bulky false positives survive. Too many, or too large, and you forbid the induced fit that lets a real ligand push a side chain aside — discarding actives for moving a residue the protein was always going to move.
+            </p>
+          </div>
+        </div>
+
+        <div className="border-l-2 border-accent pl-4 bg-accent/5 p-4 rounded-r-xl text-sm">
+          <strong className="text-foreground block mb-1">Connecting the two controls</strong>
+          <p className="text-slate-700 leading-relaxed">
+            Feature tolerance sets how much positional error you forgive on the interactions you require; excluded volumes set how much overlap you forbid with the protein you know is there. A well-built model tightens one to compensate for loosening the other — which is why quoting a pharmacophore&apos;s hit rate without stating both is meaningless.
+          </p>
+        </div>
+      </section>
+
+      {/* Conformers */}
+      <section className="space-y-4 border-t border-border pt-8">
+        <h2>7. Conformers: The Step That Quietly Decides Everything</h2>
+        <p>
+          A 3D pharmacophore describes features at fixed distances, but the molecules you are screening are flexible and stored as 2D graphs. Before any matching happens, every database compound must be expanded into a <strong>conformer ensemble</strong> — a set of plausible 3D shapes. A compound is scored as a hit if <em>any single conformer</em> satisfies the query.
+        </p>
+        <p>
+          This makes conformer generation a silent gatekeeper. If the bioactive conformation is not in the ensemble, the compound cannot match, no matter how good the molecule is or how well built the pharmacophore is. Most disappointing pharmacophore screens are conformer failures misdiagnosed as model failures.
+        </p>
+
+        <div className="space-y-3 not-prose">
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">How many conformers?</h4>
+            <p className="text-sm text-slate-800 leading-relaxed font-medium">
+              Coverage rises steeply and then plateaus, while cost rises without limit. A rigid ring system may need a handful; a chain with eight rotatable bonds may need hundreds before the bioactive shape reliably appears. Common practice is a per-molecule cap (often 50–500) together with an energy window that discards conformers far above the local minimum, on the argument that a ligand will not pay an arbitrarily large strain penalty to bind.
+            </p>
+          </div>
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">The strain-energy trap</h4>
+            <p className="text-sm text-slate-800 leading-relaxed font-medium">
+              Tighten the energy window too far and you delete the bioactive conformation, because bound ligands genuinely do adopt strained geometries — binding pays for the strain out of the interaction energy. Loosen it too far and you fill the ensemble with shapes no molecule adopts, letting almost anything match something. This is the conformational search problem from Module 4, arriving in a new costume.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Validation */}
+      <section className="space-y-4 border-t border-border pt-8">
+        <h2>8. Validating a Pharmacophore Model</h2>
+        <p>
+          A pharmacophore query will always return <em>something</em>. The question is whether those hits are enriched in real actives or merely numerous, and you cannot answer it by inspecting the model — you have to test it retrospectively against compounds whose answer you already know.
+        </p>
+        <p>
+          Build a validation set of known actives plus <strong>decoys</strong>: compounds presumed inactive, chosen to match the actives in gross physicochemical properties (molecular weight, logP, charge, rotatable bonds) while differing in topology. The property matching is essential. Random decoys make any model look excellent, because the model ends up separating small polar molecules from large greasy ones rather than recognising the pharmacophore.
+        </p>
+
+        <div className="overflow-x-auto not-prose">
+          <table className="w-full text-sm border border-border rounded-xl overflow-hidden">
+            <thead className="bg-slate-50 dark:bg-slate-900">
+              <tr className="text-left">
+                <th className="px-3 py-2 font-bold text-slate-900 dark:text-slate-100">Metric</th>
+                <th className="px-3 py-2 font-bold text-slate-900 dark:text-slate-100">What it measures</th>
+                <th className="px-3 py-2 font-bold text-slate-900 dark:text-slate-100">Watch out for</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              <tr>
+                <td className="px-3 py-2 font-semibold">Sensitivity (recall)</td>
+                <td className="px-3 py-2 text-slate-700">Fraction of known actives the query retrieves</td>
+                <td className="px-3 py-2 text-slate-700">Trivially 1.0 for a query loose enough to match everything</td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2 font-semibold">Specificity</td>
+                <td className="px-3 py-2 text-slate-700">Fraction of decoys correctly rejected</td>
+                <td className="px-3 py-2 text-slate-700">Depends entirely on how well the decoys were chosen</td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2 font-semibold">Enrichment factor (EF)</td>
+                <td className="px-3 py-2 text-slate-700">How much richer in actives the hit list is than the database</td>
+                <td className="px-3 py-2 text-slate-700">Bounded by 1/(active fraction) — compare only at the same cut-off</td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2 font-semibold">Güner-Henry (GH) score</td>
+                <td className="px-3 py-2 text-slate-700">Combines yield of actives and recall into one 0–1 number</td>
+                <td className="px-3 py-2 text-slate-700">A single number hides which half of the trade-off you bought</td>
+              </tr>
+              <tr>
+                <td className="px-3 py-2 font-semibold">ROC-AUC</td>
+                <td className="px-3 py-2 text-slate-700">Ranking quality across every possible threshold</td>
+                <td className="px-3 py-2 text-slate-700">Rewards global ranking; screening only cares about the top of the list</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p className="text-sm text-slate-700">
+          These are the same metrics used to judge any screening method, and they are treated in full — including the early-recognition problem and how to put a confidence interval on an AUC — in <strong>Module 8</strong>.
+        </p>
+
+        <div className="border-l-2 border-rose-400 pl-4 bg-rose-50/50 dark:bg-rose-950/10 p-4 rounded-r-xl text-sm space-y-2">
+          <strong className="text-foreground block">Four ways a pharmacophore model goes wrong</strong>
+          <ul className="list-disc pl-5 space-y-1.5 text-slate-700 leading-relaxed">
+            <li><strong>Too few features.</strong> A two-point query is a substructure search with extra steps; it will match thousands of unrelated compounds.</li>
+            <li><strong>Too many features.</strong> Every additional required point multiplies the chance that a genuine active misses one. Models built from a single co-crystal are especially prone to encoding incidental contacts as requirements.</li>
+            <li><strong>No excluded volumes.</strong> The query describes chemistry but not shape, and oversized compounds sail through.</li>
+            <li><strong>Actives too similar to each other.</strong> If every training ligand shares a scaffold, the model encodes that scaffold rather than the pharmacophore — and you lose the scaffold hopping that was the point of the method.</li>
+          </ul>
+        </div>
+      </section>
+
+      {/* Advanced Topic: 3D Pharmacophore Fingerprints */}
+      <section className="space-y-4 border-t border-border pt-8">
+        <h2>9. Advanced: 3D Pharmacophore Fingerprints &amp; Dynamic Pharmacophores</h2>
+        <p>
+          To accelerate screening, computers encode pharmacophores into 1D bit-strings called <strong>pharmacophore fingerprints</strong>. Instead of doing geometry alignments on the fly, molecules are represented as bins of distance pairs.
+        </p>
+        <div className="bg-surface border border-border p-5 rounded-xl text-sm space-y-3 not-prose">
+          <p className="font-bold text-foreground flex items-center gap-1.5">
+            <Info className="h-4 w-4 text-accent" />
+            How Pharmacophore Fingerprints Are Calculated:
+          </p>
+          <ol className="list-decimal pl-5 space-y-2 text-slate-800 leading-relaxed font-medium">
+            <li>Identify all pharmacophoric features (e.g. HBA, HBD, AR) inside a molecule.</li>
+            <li>For every unique combination of three features, calculate the distances between them, creating a 3D triangle.</li>
+            <li>Assign each distance to a specific range bin (e.g., bin 1 = 2.0–3.0 Å, bin 2 = 3.0–4.5 Å).</li>
+            <li>Set the bit at the calculated index in the fingerprint to <code className="bg-white px-1.5 py-0.5 rounded border border-border font-bold">1</code>.</li>
+            <li>Compare candidate fingerprints to target templates using similarity metrics to identify matches in milliseconds.</li>
+          </ol>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 not-prose pt-4">
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1">
+            <h4 className="font-bold text-sm text-slate-900">3D Pharmacophore Hashes</h4>
+            <p className="text-sm text-slate-800 leading-relaxed font-medium">
+              A 3D pharmacophore hash represents a unique geometric descriptor that indexes the absolute configuration of pharmacophore points. It encodes feature types (e.g., Donor, Acceptor, Hydrophobic) and their spatial distances as a hashed integer or string. This enables databases like ZINC and PubChem to index 3D chemical conformers and perform exact spatial searches in microseconds without alignment.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1">
+            <h4 className="font-bold text-sm text-slate-900">Dynamic Pharmacophores from MD</h4>
+            <p className="text-sm text-slate-800 leading-relaxed font-medium">
+              Static crystal structures do not account for protein flexibility. By running Molecular Dynamics (MD) simulations of a protein-ligand complex, chemists capture the dynamic fluctuations of the binding pocket. Extracting frames from the MD trajectory and calculating pocket-ligand interactions over time allows clustering of transient geometries. The centroid conformations represent the most stable, <strong>representative dynamic pharmacophores</strong> that exist in solution.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Quiz Section */}
+      <hr className="border-slate-200 my-8" />
+      <section className="space-y-5">
+        <h2>Knowledge check</h2>
+        <Quiz 
+          moduleTitle="Module 7: Pharmacophore Modeling"
+          questions={[
+            {
+              question: "What is the scientific purpose of applying the DBSCAN clustering algorithm during 3D pocket extraction?",
+              options: [
+                "It calculates the binding free energy of co-crystallized complexes.",
+                "It resolves crystallographic steric clashes and missing loops.",
+                "It groups aligned ligand coordinates by spatial density to cleanly isolate orthosteric binding pockets from allosteric sites and noise.",
+                "It assigns partial charges to raw PDB coordinates using semi-empirical Hamiltonians."
+              ],
+              correctIndex: 2,
+              explanation: "DBSCAN is a density-based spatial clustering algorithm. It is used to group co-crystallized ligand atoms overlaying in 3D space, which allows the pipeline to separate the orthosteric active site from allosteric binding pockets and filter out sparse water or buffer artifacts without knowing the number of clusters in advance."
+            },
+            {
+              question: "Why can you NOT feed raw ligand coordinates extracted directly from PDB files straight into RDKit for feature extraction?",
+              options: [
+                "PDB coordinates are encrypted by crystallographic symmetry.",
+                "PDB formats do not store bond orders, which would render the chemical structures and downstream feature tagging silently incorrect.",
+                "RDKit only parses line notations like SMILES or SELFIES.",
+                "PDB files only support macromolecular residues and reject small organic ligands."
+              ],
+              correctIndex: 1,
+              explanation: "PDB coordinates do not contain bond order metadata, resulting in all bonds returning as ambiguous single bonds. Downstream chemoinformatics libraries like RDKit need correct bond topologies to tag features accurately, which requires matching raw 3D coords against a 2D SMILES template to restore proper double bonds, aromatic rings, and carbonyls."
+            },
+            {
+              question: "How is the final consensus pharmacophore query compiled from the clustered ligand feature points?",
+              options: [
+                "We select the single highest-resolution PDB structure and copy its ligand points exactly.",
+                "All features from all input ligands are combined, generating a dense map of thousands of points.",
+                "A k-means algorithm is run within each feature type, keeping only the centroids shared by at least 50% of active input ligands.",
+                "The consensus model is derived using standard Tanimoto fingerprint similarities."
+              ],
+              correctIndex: 2,
+              explanation: "To distill a clean geometric query from a cloud of thousands of points, features are grouped by class (e.g. all acceptors) and clustered using k-means. Centroids representing hotspots shared by a majority of active input ligands (>= 50%) are retained as the consensus pharmacophore query."
+            },
+            {
+              question: "A structure-based pharmacophore built from three required features retrieves a very large number of hits, many of them far bulkier than the co-crystallized ligand. What is the most likely omission?",
+              options: [
+                "The feature tolerance radius was set too small.",
+                "The model has no excluded volumes, so it constrains chemistry but not shape.",
+                "The conformer ensembles were generated with too high an energy window.",
+                "The aromatic feature should have been defined as hydrophobic."
+              ],
+              correctIndex: 1,
+              explanation: "Required features specify what a molecule must have, not where it must not go. Without excluded volumes marking the receptor atoms lining the pocket, an oversized compound can satisfy every feature point while also occupying space the protein already fills. Adding excluded volumes from the receptor is the standard fix and is nearly free in a structure-based model."
+            },
+            {
+              question: "A pharmacophore model reports 95% sensitivity and 98% specificity against its validation set, but performs poorly in a prospective screen. The decoys were drawn at random from a vendor catalogue. What went wrong?",
+              options: [
+                "The validation set was too large, causing overfitting of the tolerance radii.",
+                "Random decoys differ from the actives in bulk properties, so the model was rewarded for separating physicochemistry rather than recognising the pharmacophore.",
+                "Sensitivity and specificity are invalid metrics for pharmacophore models.",
+                "The model should have been validated with ROC-AUC, which is immune to decoy selection."
+              ],
+              correctIndex: 1,
+              explanation: "Decoys must be property-matched to the actives — similar molecular weight, logP, charge, and rotatable-bond count — while differing in topology. Random decoys typically differ from the actives in gross properties, so a model can score superbly by separating small polar molecules from large greasy ones, which is not what it will be asked to do prospectively. No choice of metric repairs a badly chosen decoy set."
+            }
+          ]}
+        />
+      </section>
+    </div>
+  );
+}

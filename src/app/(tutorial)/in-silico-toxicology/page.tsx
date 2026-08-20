@@ -1,0 +1,918 @@
+"use client";
+
+import React, { useState } from "react";
+import Link from "next/link";
+import {
+  Info,
+  Sliders, 
+  CheckCircle, 
+  AlertTriangle, 
+  ShieldAlert, 
+  Activity, 
+  Settings,
+  Sparkles
+} from "lucide-react";
+import { Quiz } from "@/components/Quiz";
+import { CollapsibleCode } from "@/components/CollapsibleCode";
+
+interface CompoundToxData {
+  name: string;
+  smiles: string;
+  cardioProb: number;
+  hepatoProb: number;
+  mutagenProb: number;
+  properties: {
+    mw: number;
+    logP: number;
+    basicNitrogens: number;
+  };
+  shapFeatures: {
+    feature: string;
+    impact: number; // positive = toxic force, negative = safety force
+    description: string;
+  }[];
+}
+
+const COMPOUNDS_DATABASE: CompoundToxData[] = [
+  {
+    name: "Terfenadine",
+    smiles: "CC(C)(C)C1=CC=C(C=C1)C(O)CCCN2CCC(CC2)C(O)(C3=CC=CC=C3)C4=CC=CC=C4",
+    cardioProb: 0.94,
+    hepatoProb: 0.58,
+    mutagenProb: 0.05,
+    properties: {
+      mw: 471.7,
+      logP: 6.2,
+      basicNitrogens: 1
+    },
+    shapFeatures: [
+      { feature: "Basic Tertiary Amine", impact: 0.45, description: "Fits the hERG channel electrostatic cavity, triggering severe block risk." },
+      { feature: "High Lipophilicity (LogP > 5)", impact: 0.25, description: "Promotes non-specific membrane accumulation and off-target bindings." },
+      { feature: "Hydrophobic Phenyl Rings", impact: 0.15, description: "Forms stable hydrophobic interactions with aromatic residues inside the hERG vestibule." },
+      { feature: "No Electrophilic Alerts", impact: -0.10, description: "Reduces mutagenicity/DNA-alkylating potential close to zero." }
+    ]
+  },
+  {
+    name: "Acetaminophen (Paracetamol)",
+    smiles: "CC(=O)NC1=CC=C(O)C=C1",
+    cardioProb: 0.08,
+    hepatoProb: 0.82,
+    mutagenProb: 0.12,
+    properties: {
+      mw: 151.2,
+      logP: 0.46,
+      basicNitrogens: 0
+    },
+    shapFeatures: [
+      { feature: "Quinone-Imine Precursor", impact: 0.55, description: "Metabolic oxidation yields highly reactive NAPQI, causing cellular oxidative stress and DILI." },
+      { feature: "Phenol Hydroxyl Group", impact: 0.20, description: "Subject to phase-II conjugation but also direct oxidation paths generating free radical intermediates." },
+      { feature: "Low Lipophilicity", impact: -0.15, description: "Prevents hERG channel binding and membrane toxicity." },
+      { feature: "Small Molecular Size", impact: -0.10, description: "Facilitates rapid clearance pathways in healthy liver tissue." }
+    ]
+  },
+  {
+    name: "Aspirin (Acetylsalicylic Acid)",
+    smiles: "CC(=O)OC1=CC=CC=C1C(=O)O",
+    cardioProb: 0.04,
+    hepatoProb: 0.15,
+    mutagenProb: 0.02,
+    properties: {
+      mw: 180.2,
+      logP: 1.19,
+      basicNitrogens: 0
+    },
+    shapFeatures: [
+      { feature: "Ester Cleavage Site", impact: -0.25, description: "Rapidly hydrolyzed in vivo to salicylate, preventing accumulation and reactive metabolism." },
+      { feature: "Polar Carboxylate Group", impact: -0.20, description: "Charged state at physiological pH minimizes cellular membrane penetration and off-target cardiotoxicity." },
+      { feature: "Salicylate Core", impact: 0.05, description: "Weak acidic profile with low liver toxicity at standard dosage." },
+      { feature: "No Reactive Elements", impact: -0.15, description: "Reduces overall mutagenicity profile to background levels." }
+    ]
+  }
+];
+
+// Physicochemical profiles for the drug-likeness calculator.
+// HBA/HBD follow the Lipinski counting convention (HBA = N+O atoms, HBD = N-H/O-H).
+const DRUGLIKE_PRESETS: Record<string, { mw: number; logP: number; hbd: number; hba: number; tpsa: number; rotb: number }> = {
+  Aspirin:        { mw: 180, logP: 1.2, hbd: 1, hba: 4, tpsa: 63.6, rotb: 3 },
+  Acetaminophen:  { mw: 151, logP: 0.5, hbd: 2, hba: 3, tpsa: 49.3, rotb: 1 },
+  Terfenadine:    { mw: 472, logP: 6.2, hbd: 2, hba: 3, tpsa: 43.7, rotb: 8 },
+  Atorvastatin:   { mw: 559, logP: 5.0, hbd: 4, hba: 7, tpsa: 111.8, rotb: 12 },
+};
+
+interface PairedPrediction {
+  label: 0 | 1;
+  commonNoise: number;
+  modelANoise: number;
+  modelBNoise: number;
+}
+
+const PAIRED_PREDICTION_POOL: PairedPrediction[] = (() => {
+  let state = 12012;
+  const randomCentered = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return (state / 4294967296) * 2 - 1;
+  };
+
+  return Array.from({ length: 400 }, (_, index) => ({
+    label: index % 4 === 0 ? 1 : 0,
+    commonNoise: randomCentered(),
+    modelANoise: randomCentered(),
+    modelBNoise: randomCentered(),
+  }));
+})();
+
+function placementValue(positiveScore: number, negativeScore: number) {
+  if (positiveScore > negativeScore) return 1;
+  if (positiveScore === negativeScore) return 0.5;
+  return 0;
+}
+
+function sampleCovariance(left: number[], right: number[]) {
+  if (left.length < 2) return 0;
+  const leftMean = left.reduce((sum, value) => sum + value, 0) / left.length;
+  const rightMean = right.reduce((sum, value) => sum + value, 0) / right.length;
+  return (
+    left.reduce(
+      (sum, value, index) => sum + (value - leftMean) * (right[index] - rightMean),
+      0,
+    ) /
+    (left.length - 1)
+  );
+}
+
+function normalCdf(z: number) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const density = 0.3989423 * Math.exp(-(z * z) / 2);
+  const tail =
+    density *
+    t *
+    (0.3193815 +
+      t * (-0.3565638 + t * (1.7814779 + t * (-1.821256 + t * 1.330274))));
+  return z > 0 ? 1 - tail : tail;
+}
+
+function calculateDeLongComparison(sampleSize: number, biologicalSignal: number) {
+  const predictions = PAIRED_PREDICTION_POOL.slice(0, sampleSize).map((row) => ({
+    label: row.label,
+    modelA: 0.7 * row.commonNoise + 0.3 * row.modelANoise + row.label * 0.35,
+    modelB:
+      0.7 * row.commonNoise +
+      0.3 * row.modelBNoise +
+      row.label * (0.35 + biologicalSignal),
+  }));
+  const positives = predictions.filter((row) => row.label === 1);
+  const negatives = predictions.filter((row) => row.label === 0);
+
+  const placements = (key: "modelA" | "modelB") => {
+    const positivePlacements = positives.map(
+      (positive) =>
+        negatives.reduce(
+          (sum, negative) => sum + placementValue(positive[key], negative[key]),
+          0,
+        ) / negatives.length,
+    );
+    const negativePlacements = negatives.map(
+      (negative) =>
+        positives.reduce(
+          (sum, positive) => sum + placementValue(positive[key], negative[key]),
+          0,
+        ) / positives.length,
+    );
+    const auc =
+      positivePlacements.reduce((sum, value) => sum + value, 0) /
+      positivePlacements.length;
+    return { auc, positivePlacements, negativePlacements };
+  };
+
+  const modelA = placements("modelA");
+  const modelB = placements("modelB");
+  const varianceA =
+    sampleCovariance(modelA.positivePlacements, modelA.positivePlacements) /
+      positives.length +
+    sampleCovariance(modelA.negativePlacements, modelA.negativePlacements) /
+      negatives.length;
+  const varianceB =
+    sampleCovariance(modelB.positivePlacements, modelB.positivePlacements) /
+      positives.length +
+    sampleCovariance(modelB.negativePlacements, modelB.negativePlacements) /
+      negatives.length;
+  const covariance =
+    sampleCovariance(modelA.positivePlacements, modelB.positivePlacements) /
+      positives.length +
+    sampleCovariance(modelA.negativePlacements, modelB.negativePlacements) /
+      negatives.length;
+  const standardError = Math.sqrt(Math.max(varianceA + varianceB - 2 * covariance, 1e-12));
+  const difference = modelB.auc - modelA.auc;
+  const zScore = difference / standardError;
+  const pValue = 2 * (1 - normalCdf(Math.abs(zScore)));
+  const confidenceInterval = (auc: number, variance: number) => [
+    Math.max(0, auc - 1.96 * Math.sqrt(variance)),
+    Math.min(1, auc + 1.96 * Math.sqrt(variance)),
+  ];
+
+  return {
+    aucA: modelA.auc,
+    aucB: modelB.auc,
+    ciA: confidenceInterval(modelA.auc, varianceA),
+    ciB: confidenceInterval(modelB.auc, varianceB),
+    difference,
+    zScore,
+    pValue,
+    significant: pValue < 0.05,
+    positiveCount: positives.length,
+    negativeCount: negatives.length,
+  };
+}
+
+export default function InSilicoToxicologyPage() {
+  const [selectedComp, setSelectedComp] = useState<CompoundToxData>(COMPOUNDS_DATABASE[0]);
+  const [biologicalSignal, setBiologicalSignal] = useState(0.08);
+  const [comparisonSampleSize, setComparisonSampleSize] = useState(160);
+
+  // Drug-likeness calculator state
+  const [dlPick, setDlPick] = useState<string>("Aspirin");
+  const [mw, setMw] = useState<number>(DRUGLIKE_PRESETS.Aspirin.mw);
+  const [dlLogP, setDlLogP] = useState<number>(DRUGLIKE_PRESETS.Aspirin.logP);
+  const [hbd, setHbd] = useState<number>(DRUGLIKE_PRESETS.Aspirin.hbd);
+  const [hba, setHba] = useState<number>(DRUGLIKE_PRESETS.Aspirin.hba);
+  const [tpsa, setTpsa] = useState<number>(DRUGLIKE_PRESETS.Aspirin.tpsa);
+  const [rotb, setRotb] = useState<number>(DRUGLIKE_PRESETS.Aspirin.rotb);
+
+  const applyPreset = (name: string) => {
+    const p = DRUGLIKE_PRESETS[name];
+    if (!p) return;
+    setDlPick(name);
+    setMw(p.mw); setDlLogP(p.logP); setHbd(p.hbd); setHba(p.hba); setTpsa(p.tpsa); setRotb(p.rotb);
+  };
+
+  // Lipinski Rule of Five: MW≤500, LogP≤5, HBD≤5, HBA≤10 (≤1 violation tolerated)
+  const ro5Checks = [
+    { label: "MW ≤ 500", ok: mw <= 500, value: `${mw.toFixed(0)} Da` },
+    { label: "LogP ≤ 5", ok: dlLogP <= 5, value: dlLogP.toFixed(1) },
+    { label: "HBD ≤ 5", ok: hbd <= 5, value: `${hbd}` },
+    { label: "HBA ≤ 10", ok: hba <= 10, value: `${hba}` },
+  ];
+  const ro5Violations = ro5Checks.filter((c) => !c.ok).length;
+  const ro5Pass = ro5Violations <= 1;
+  // Veber oral-bioavailability rules
+  const veberChecks = [
+    { label: "Rotatable bonds ≤ 10", ok: rotb <= 10, value: `${rotb}` },
+    { label: "TPSA ≤ 140 Å²", ok: tpsa <= 140, value: `${tpsa.toFixed(0)} Å²` },
+  ];
+  const veberPass = veberChecks.every((c) => c.ok);
+  // TPSA-based absorption heuristic
+  const absorptionNote =
+    tpsa > 140
+      ? "TPSA > 140 Å² — poor passive intestinal absorption expected."
+      : tpsa < 90
+      ? "TPSA < 90 Å² — good oral absorption; may also cross the blood-brain barrier."
+      : "TPSA 90–140 Å² — adequate oral absorption, unlikely to be CNS-penetrant.";
+
+  const stats = calculateDeLongComparison(comparisonSampleSize, biologicalSignal);
+  const pValueLabel = stats.pValue < 0.0001 ? "< 0.0001" : stats.pValue.toFixed(4);
+
+  return (
+    <div className="space-y-8">
+      {/* Header */}
+      <div>
+        <h1>Module 12: In Silico ADMET &amp; Safety Assessment</h1>
+        <p className="lead text-slate-600">
+          Predict whether a molecule can become a drug and whether it will be safe. Start with the physicochemical rules of ADME and oral drug-likeness (Lipinski, Veber), then predict toxicity endpoints (cardiotoxicity, hepatotoxicity, mutagenicity) with machine learning, comparing models with DeLong&apos;s test and interpreting alerts using SHAP values.
+        </p>
+      </div>
+
+      <hr className="border-slate-100 dark:border-slate-900" />
+
+      {/* Learning outcomes */}
+      <section className="rounded-xl border border-border bg-surface p-5 space-y-2">
+        <h2 className="!mt-0 !text-base font-bold">Learning outcomes</h2>
+        <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1 leading-relaxed">
+          <li>Profile oral drug-likeness with Lipinski and Veber, treating both as alerts not gates.</li>
+          <li>Explain the mechanisms behind hERG, DILI, and Ames liabilities.</li>
+          <li>Build and validate a toxicity classifier for an imbalanced dataset.</li>
+          <li>Interpret SHAP attributions on a toxicophore and state their limits.</li>
+          <li>Say what a structure-derived safety prediction cannot tell you about exposure.</li>
+        </ul>
+      </section>
+
+      {/* Section 1: Predictive Toxicology */}
+      <section className="space-y-4">
+        <h2>1. Critical Safety Endpoints in Drug Discovery</h2>
+        <p>
+          Up to <strong>30% of drug candidates fail</strong> in clinical trials due to safety and toxicity issues. Discovery toxicology leverages in silico models to predict hazard profiles early, filtering out toxic compounds before they reach animal or human testing. Three primary endpoints dominate chemical safety screening:
+        </p>
+        
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 not-prose">
+          <div className="p-4 rounded-xl border border-border bg-white space-y-2">
+            <h4 className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+              <ShieldAlert className="h-4 w-4 text-red-500" />
+              Cardiotoxicity (hERG)
+            </h4>
+            <p className="text-xs text-slate-800 leading-relaxed font-medium">
+              Blockade of the potassium voltage-gated channel <strong>hERG</strong> delays cardiac repolarization, causing QT interval prolongation and potentially fatal arrhythmias. Models predict structural binding affinity to hERG using regression or classification.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-xl border border-border bg-white space-y-2">
+            <h4 className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              Hepatotoxicity (DILI)
+            </h4>
+            <p className="text-xs text-slate-800 leading-relaxed font-medium">
+              <strong>Drug-Induced Liver Injury (DILI)</strong> is a leading cause of drug withdrawals. Hepatotoxicity arises from metabolic activation (e.g. generating reactive quinone-imines), mitochondrial dysfunction, or bile duct obstruction, modeled using binary classifiers.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-xl border border-border bg-white space-y-2">
+            <h4 className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+              <Activity className="h-4 w-4 text-indigo-500" />
+              Mutagenicity (Ames Test)
+            </h4>
+            <p className="text-xs text-slate-800 leading-relaxed font-medium">
+              Mutagenic compounds react with DNA, causing genetic lesions that lead to carcinogenicity. In silico models identify structural electrophilic alerts (e.g. aromatic nitro groups, alkyl halides) that correlate with a positive bacterial Ames test.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Section 2: ADME & Drug-Likeness */}
+      <section className="space-y-4 border-t border-border pt-8">
+        <h2>2. ADME &amp; Drug-Likeness: The Physicochemical Gatekeepers</h2>
+        <p>
+          Before toxicity, a candidate must actually <em>reach</em> its target and survive the body. <strong>ADME</strong> — Absorption, Distribution, Metabolism, Excretion — is governed largely by a few physicochemical properties. Simple rule-based filters flag molecules unlikely to be orally bioavailable long before expensive assays.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 not-prose">
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1">
+            <h4 className="font-bold text-sm text-slate-900">Lipophilicity (LogP / LogD)</h4>
+            <p className="text-xs text-slate-800 leading-relaxed font-medium">
+              The octanol/water partition coefficient. <strong>LogD</strong> accounts for ionization at a given pH. Too low → poor membrane permeation; too high (&gt;5) → poor solubility, promiscuity, and hERG/off-target risk.
+            </p>
+          </div>
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1">
+            <h4 className="font-bold text-sm text-slate-900">Polar Surface Area (TPSA)</h4>
+            <p className="text-xs text-slate-800 leading-relaxed font-medium">
+              The surface area over polar (N, O) atoms and their attached hydrogens. Predicts passive absorption: <strong>&lt;140 Å²</strong> for gut absorption, <strong>&lt;90 Å²</strong> to cross the blood-brain barrier.
+            </p>
+          </div>
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1">
+            <h4 className="font-bold text-sm text-slate-900">Metabolism &amp; Clearance</h4>
+            <p className="text-xs text-slate-800 leading-relaxed font-medium">
+              Hepatic <strong>CYP450</strong> enzymes (3A4, 2D6, 2C9) run phase-I oxidation; phase-II conjugation follows. Renal clearance favors small, polar compounds. These set the dose and half-life.
+            </p>
+          </div>
+        </div>
+
+        <div className="not-prose bg-slate-50 border border-slate-200 rounded-xl p-4 text-sm text-slate-800 font-medium">
+          <span className="font-bold text-slate-900">Lipinski&apos;s Rule of Five</span> (Pfizer, 1997): poor absorption is more likely when <strong>MW &gt; 500</strong>, <strong>LogP &gt; 5</strong>, <strong>H-bond donors &gt; 5</strong>, or <strong>H-bond acceptors &gt; 10</strong>. A drug-like molecule violates at most one. <strong>Veber&apos;s rules</strong> add <strong>rotatable bonds ≤ 10</strong> and <strong>TPSA ≤ 140 Å²</strong> for oral bioavailability.
+        </div>
+      </section>
+
+      {/* Interactive Widget: Rule-of-Five Calculator */}
+      <section className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-4">
+        <div className="flex items-center gap-2">
+          <Sliders size={18} className="text-slate-900" />
+          <h3 className="font-bold text-base text-slate-900">Interactive Playground: Drug-Likeness Scorecard</h3>
+        </div>
+        <p className="text-sm text-slate-800 leading-normal">
+          Load a known drug or drag the sliders to profile a virtual molecule. Watch each Lipinski and Veber criterion flip pass/fail. Note that approved drugs (e.g. <strong>Atorvastatin</strong>) sometimes break a rule — the guidelines are alerts, not hard cutoffs.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-6 bg-white p-5 rounded-lg border border-slate-200">
+          {/* Sliders */}
+          <div className="md:col-span-7 space-y-3">
+            <div className="flex flex-wrap gap-1.5">
+              {Object.keys(DRUGLIKE_PRESETS).map((name) => (
+                <button
+                  key={name}
+                  onClick={() => applyPreset(name)}
+                  className={`px-2.5 py-1 rounded-md text-xs font-bold border transition-colors ${
+                    dlPick === name
+                      ? "bg-slate-900 text-white border-slate-900 dark:bg-blue-600 dark:border-blue-500"
+                      : "bg-white text-slate-800 border-slate-300 hover:border-slate-500"
+                  }`}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+
+            {[
+              { label: "Molecular Weight", val: mw, set: setMw, min: 100, max: 700, step: 1, unit: "Da", limit: mw > 500 },
+              { label: "LogP", val: dlLogP, set: setDlLogP, min: -2, max: 8, step: 0.1, unit: "", limit: dlLogP > 5 },
+              { label: "H-Bond Donors", val: hbd, set: setHbd, min: 0, max: 10, step: 1, unit: "", limit: hbd > 5 },
+              { label: "H-Bond Acceptors", val: hba, set: setHba, min: 0, max: 15, step: 1, unit: "", limit: hba > 10 },
+              { label: "TPSA", val: tpsa, set: setTpsa, min: 0, max: 200, step: 1, unit: "Å²", limit: tpsa > 140 },
+              { label: "Rotatable Bonds", val: rotb, set: setRotb, min: 0, max: 15, step: 1, unit: "", limit: rotb > 10 },
+            ].map((s) => (
+              <div key={s.label} className="space-y-1" onMouseDown={() => setDlPick("Custom")} onTouchStart={() => setDlPick("Custom")}>
+                <div className="flex justify-between items-center text-xs font-bold text-slate-800">
+                  <span>{s.label}</span>
+                  <span className={`font-mono ${s.limit ? "text-rose-600" : "text-slate-900"}`}>
+                    {s.step < 1 ? s.val.toFixed(1) : s.val.toFixed(0)} {s.unit}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={s.min}
+                  max={s.max}
+                  step={s.step}
+                  value={s.val}
+                  onChange={(e) => s.set(parseFloat(e.target.value))}
+                  className={`w-full h-1.5 rounded appearance-none cursor-pointer ${s.limit ? "accent-rose-600 bg-rose-100" : "accent-slate-900 bg-slate-100"}`}
+                />
+              </div>
+            ))}
+          </div>
+
+          {/* Scorecard */}
+          <div className="md:col-span-5 space-y-3">
+            <div className={`p-3 rounded-lg border ${ro5Pass ? "bg-emerald-50 border-emerald-200" : "bg-rose-50 border-rose-200"}`}>
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-bold text-slate-900">Lipinski Ro5</span>
+                {ro5Pass ? (
+                  <span className="flex items-center gap-1 text-xs font-bold text-emerald-700"><CheckCircle className="h-4 w-4" /> Pass</span>
+                ) : (
+                  <span className="flex items-center gap-1 text-xs font-bold text-rose-700"><AlertTriangle className="h-4 w-4" /> Fail</span>
+                )}
+              </div>
+              <div className="mt-2 space-y-1">
+                {ro5Checks.map((c) => (
+                  <div key={c.label} className="flex items-center justify-between text-xs font-mono">
+                    <span className={c.ok ? "text-slate-700" : "text-rose-700 font-bold"}>{c.ok ? "✓" : "✗"} {c.label}</span>
+                    <span className={c.ok ? "text-slate-500" : "text-rose-700"}>{c.value}</span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-slate-700 font-semibold mt-2">
+                {ro5Violations} violation{ro5Violations === 1 ? "" : "s"} — {ro5Pass ? "within the ≤ 1 tolerance." : "exceeds the ≤ 1 tolerance."}
+              </p>
+            </div>
+
+            <div className={`p-3 rounded-lg border ${veberPass ? "bg-emerald-50 border-emerald-200" : "bg-rose-50 border-rose-200"}`}>
+              <span className="text-sm font-bold text-slate-900">Veber (oral bioavailability)</span>
+              <div className="mt-2 space-y-1">
+                {veberChecks.map((c) => (
+                  <div key={c.label} className="flex items-center justify-between text-xs font-mono">
+                    <span className={c.ok ? "text-slate-700" : "text-rose-700 font-bold"}>{c.ok ? "✓" : "✗"} {c.label}</span>
+                    <span className={c.ok ? "text-slate-500" : "text-rose-700"}>{c.value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <p className="text-[11px] text-slate-700 font-semibold leading-snug px-1">{absorptionNote}</p>
+          </div>
+        </div>
+      </section>
+
+      <aside className="not-prose rounded-xl border border-blue-200 bg-blue-50/60 p-4 text-sm leading-relaxed text-slate-800">
+        <strong className="text-slate-950">Where this module stops:</strong> Lipinski and Veber are
+        early property alerts, not pharmacokinetic predictions. Continue to{" "}
+        <Link
+          href="/pharmacokinetics-dmpk"
+          className="font-extrabold text-blue-700 underline decoration-blue-300 underline-offset-4 hover:text-blue-900"
+        >
+          Module 15: Pharmacokinetics &amp; DMPK
+        </Link>{" "}
+        for concentration-time behavior, unbound exposure, clearance, distribution, dosing, and PK/PD linkage.
+      </aside>
+
+      {/* Section 3: Explainable AI and SHAP */}
+      <section className="space-y-4 border-t border-border pt-8">
+        <h2>3. Explainable AI: Demystifying Toxicophores with SHAP</h2>
+        <p>
+          Historically, machine learning models in toxicology were viewed as black boxes. Modern regulatory bodies require model predictions to be interpretable. <strong>SHAP (SHapley Additive exPlanations)</strong>, derived from cooperative game theory, provides a solution by assigning each molecular descriptor a value that quantifies its contribution to the final prediction.
+        </p>
+        <p>
+          In cooperative game theory, Shapley values distribute a total payoff fairly among players based on their marginal contributions. In machine learning, the &quot;payoff&quot; is the model prediction, and the &quot;players&quot; are the individual molecular features. The Shapley value for a feature <span className="font-semibold">i</span> is defined as:
+        </p>
+        <div className="my-3 font-mono text-center text-xs bg-slate-50 py-2 rounded text-slate-800 font-bold border border-slate-200">
+          {"φ_i = Σ [ (|S|! × (|F| - |S| - 1)!) / |F|! ] × [ f(S ∪ {i}) - f(S) ]"}
+        </div>
+        <p className="text-sm text-slate-800 leading-relaxed font-medium">
+          Where <span className="font-semibold">F</span> is the set of all features, <span className="font-semibold">S</span> is a subset of features excluding feature <span className="font-semibold">i</span>, and <span className="font-semibold">f(S)</span> is the prediction function. This checks every possible permutation of features to isolate the independent effect of a single chemical bit. In chemoinformatics, SHAP analysis maps these values back onto a molecule&apos;s 2D structure, highlighting exactly which chemical bits increase the probability of toxicity (toxicophores) and which structural fragments lower the risk.
+        </p>
+      </section>
+
+      {/* Section 3: User Friendly Code Block */}
+      <section className="space-y-4 border-t border-border pt-8">
+        <h2>4. Step-by-Step Toxicology Modeling &amp; SHAP Interpretation</h2>
+        <p>
+          Below is a highly documented Python implementation using RDKit, Scikit-learn, and SHAP to train a toxicity classifier, compute model applicability domains, and extract chemical explanations:
+        </p>
+
+        {/* Detailed Annotations */}
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 text-sm space-y-4">
+          <h4 className="font-bold text-slate-900 flex items-center gap-1.5 mb-1">
+            <Info className="h-4.5 w-4.5 text-blue-600" />
+            Code Architecture Explained:
+          </h4>
+          <ul className="list-disc pl-5 space-y-2.5 text-xs text-slate-800 font-medium">
+            <li>
+              <strong>Lines 1–18 (Data Setup &amp; Fingerprints)</strong>: RDKit parses SMILES strings into connection tables. It calculates circular <strong>Morgan Fingerprints</strong> (radius=2, equivalent to ECFP4) to represent the structure as a binary array of active substructural bits.
+            </li>
+            <li>
+              <strong>Lines 20–23 (Random Forest Training)</strong>: Scikit-learn fits an ensemble classifier containing 100 decision trees. The model learns to establish non-linear relationships between molecular fragments and toxicity.
+            </li>
+            <li>
+              <strong>Lines 25–29 (Model Explainer)</strong>: The tree-based explainer analyzes decision trees to compute Shapley values.
+            </li>
+            <li>
+              <strong>Lines 31–38 (SHAP Value Calculation)</strong>: Shapley values are calculated. A positive SHAP value indicates a fragment that increases toxicity risk, whereas a negative value indicates a protective or stabilizing fragment.
+            </li>
+          </ul>
+        </div>
+
+        <CollapsibleCode
+          title="Python Toxicity Prediction &amp; SHAP Explainability Script"
+          code={`# =====================================================================
+# STEP 1: IMPORT CHEMISTRY AND MACHINE LEARNING LIBRARIES
+# =====================================================================
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from sklearn.ensemble import RandomForestClassifier
+import shap
+import numpy as np
+
+# =====================================================================
+# STEP 2: LOAD MOLECULES AND GENERATE CIRCULAR FINGERPRINTS
+# =====================================================================
+# We parse raw chemical SMILES into 3D-aware connection objects
+smiles_list = ["CC(=O)OC1=CC=CC=C1C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"] # Aspirin, Caffeine
+labels = [0, 1]  # 0 = Safe/Non-Toxic, 1 = Toxic Alert
+
+mols = [Chem.MolFromSmiles(s) for s in smiles_list]
+fingerprints = []
+
+for mol in mols:
+    if mol:
+        # Generate 2048-bit Morgan Fingerprint (radius=2 represents local 2D fragments)
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+        arr = np.zeros((0,), dtype=np.int8)
+        Chem.DataStructs.ConvertToNumpyArray(fp, arr)
+        fingerprints.append(arr)
+
+# Combine chemical features and target outcomes into numpy arrays
+X_data = np.vstack(fingerprints)
+y_data = np.array(labels)
+
+# =====================================================================
+# STEP 3: TRAIN THE ENSEMBLE RANDOM FOREST CLASSIFIER
+# =====================================================================
+# Set a random seed to guarantee reproducible decision tree boundaries
+clf = RandomForestClassifier(n_estimators=100, random_state=42)
+clf.fit(X_data, y_data)
+
+# =====================================================================
+# STEP 4: INSTANTIATE TREE SHAP EXPLAINABLE AI
+# =====================================================================
+# TreeExplainer calculates exact Shapley values by traversing the tree ensemble
+explainer = shap.TreeExplainer(clf)
+shap_values = explainer.shap_values(X_data)
+
+# Extract predictions and explain the active fragments for the first compound
+first_comp_pred = clf.predict_proba(X_data[0:1])[0]
+first_comp_shap = shap_values[0] # List of 2048 contributions
+
+# Shape is (n_samples, n_features, n_classes). We pull index 1 for toxic class contributions
+print("Compound 0 Toxic Class Probability: " + str(first_comp_pred[1]))
+print("Toxicity-driving fragment SHAP value: " + str(np.max(first_comp_shap[:, 1])))`}
+        />
+      </section>
+
+      {/* Section 4: Interactive Playground */}
+      <section className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-6">
+        <div className="flex items-center gap-2">
+          <Settings size={18} className="text-slate-900" />
+          <h3 className="font-bold text-base text-slate-900">Interactive Playground: Discovery Toxicology Sandbox</h3>
+        </div>
+        <p className="text-sm text-slate-800">
+          Analyze chemical toxicophores, inspect interactive SHAP feature contributions, and use DeLong&apos;s test to ask whether paired ROC-AUC estimates are distinguishable.
+        </p>
+
+        {/* Sandbox Component 1: SHAP Explainer */}
+        <div className="bg-white p-5 rounded-lg border border-slate-200 space-y-4">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <h4 className="font-bold text-sm text-slate-900">1. Interactive SHAP Structural Profiler</h4>
+              <p className="text-xs text-slate-500 font-medium">Select a compound to analyze the positive (toxic) and negative (safe) Shapley contributions.</p>
+            </div>
+            <div className="flex gap-2">
+              {COMPOUNDS_DATABASE.map((comp) => (
+                <button
+                  key={comp.name}
+                  onClick={() => setSelectedComp(comp)}
+                  className={`px-3 py-1 rounded-lg text-xs font-semibold border transition-all ${
+                    selectedComp.name === comp.name
+                      ? "bg-indigo-600 border-indigo-600 text-white"
+                      : "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100"
+                  }`}
+                >
+                  {comp.name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 pt-2">
+            {/* Left side: Molecule properties */}
+            <div className="md:col-span-5 p-4 rounded-xl border border-slate-100 bg-slate-50/50 space-y-3">
+              <div>
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">SMILES</span>
+                <code className="text-[10px] font-mono text-slate-800 break-all leading-normal">{selectedComp.smiles}</code>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div className="bg-white p-2 rounded-lg border border-slate-200 text-center">
+                  <span className="text-[9px] font-bold text-slate-500 uppercase block">MW</span>
+                  <span className="text-xs font-bold text-slate-900">{selectedComp.properties.mw}</span>
+                </div>
+                <div className="bg-white p-2 rounded-lg border border-slate-200 text-center">
+                  <span className="text-[9px] font-bold text-slate-500 uppercase block">LogP</span>
+                  <span className="text-xs font-bold text-slate-900">{selectedComp.properties.logP}</span>
+                </div>
+                <div className="bg-white p-2 rounded-lg border border-slate-200 text-center">
+                  <span className="text-[9px] font-bold text-slate-500 uppercase block">Basic N</span>
+                  <span className="text-xs font-bold text-slate-900">{selectedComp.properties.basicNitrogens}</span>
+                </div>
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">Predicted Safety Probabilities</span>
+                <div className="space-y-1 text-xs">
+                  <div className="flex justify-between items-center bg-white px-2 py-1 rounded border border-slate-200">
+                    <span className="font-semibold text-slate-700">hERG Cardiotox:</span>
+                    <span className={`font-bold ${selectedComp.cardioProb > 0.5 ? "text-red-600" : "text-emerald-600"}`}>
+                      {(selectedComp.cardioProb * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center bg-white px-2 py-1 rounded border border-slate-200">
+                    <span className="font-semibold text-slate-700">DILI Hepatotox:</span>
+                    <span className={`font-bold ${selectedComp.hepatoProb > 0.5 ? "text-red-600" : "text-emerald-600"}`}>
+                      {(selectedComp.hepatoProb * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center bg-white px-2 py-1 rounded border border-slate-200">
+                    <span className="font-semibold text-slate-700">Ames Mutagenicity:</span>
+                    <span className={`font-bold ${selectedComp.mutagenProb > 0.5 ? "text-red-600" : "text-emerald-600"}`}>
+                      {(selectedComp.mutagenProb * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Right side: SHAP Forces graph */}
+            <div className="md:col-span-7 space-y-4">
+              <span className="text-xs font-bold text-slate-700 block">SHAP Contribution Analysis (Toxicity Driving Forces)</span>
+              
+              <div className="space-y-2">
+                {selectedComp.shapFeatures.map((f, idx) => (
+                  <div key={idx} className="space-y-1">
+                    <div className="flex justify-between text-xs font-medium">
+                      <span className="text-slate-800 font-bold">{f.feature}</span>
+                      <span className={f.impact > 0 ? "text-red-600 font-bold" : "text-blue-600 font-bold"}>
+                        {f.impact > 0 ? `+${f.impact.toFixed(2)}` : `${f.impact.toFixed(2)}`}
+                      </span>
+                    </div>
+                    {/* Bar visualization */}
+                    <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden flex">
+                      {f.impact > 0 ? (
+                        <>
+                          <div className="h-full bg-slate-200" style={{ width: "50%" }} />
+                          <div className="h-full bg-red-500" style={{ width: `${Math.min(f.impact * 100, 50)}%` }} />
+                        </>
+                      ) : (
+                        <>
+                          <div className="h-full bg-slate-100" style={{ width: `${Math.max(50 - Math.abs(f.impact) * 100, 0)}%` }} />
+                          <div className="h-full bg-blue-500" style={{ width: `${Math.min(Math.abs(f.impact) * 100, 50)}%` }} />
+                          <div className="h-full bg-slate-200" style={{ width: "50%" }} />
+                        </>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-tight font-medium pl-1">{f.description}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="p-3 rounded-lg bg-indigo-50 border border-indigo-100 text-xs font-medium text-indigo-950 flex items-start gap-2">
+                <Sparkles size={14} className="text-indigo-600 flex-shrink-0 mt-0.5" />
+                <p>
+                  The red bars push the model towards a positive toxic classification. The blue bars pull the probability back down. An active basic tertiary nitrogen (Terfenadine) or a reactive quinone-imine metabolite (Acetaminophen) are massive positive forces pushing the compound into the high-risk region.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Sandbox Component 2: DeLong model comparison */}
+        <div className="bg-white p-5 rounded-lg border border-slate-200 space-y-4">
+          <div>
+            <h4 className="font-bold text-sm text-slate-900">2. Paired DeLong ROC Explorer</h4>
+            <p className="text-xs text-slate-600 font-medium leading-relaxed">
+              Compare two models on the same synthetic holdout set. Model A uses a chemical signal;
+              Model B receives an adjustable orthogonal signal representing a possible contribution
+              from Cell Painting. AUCs, covariance, confidence intervals, and the paired DeLong test
+              are calculated from the sample-level scores.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 pt-2">
+            {/* Controller sliders */}
+            <div className="md:col-span-5 space-y-4">
+              <div className="space-y-2">
+                <div className="flex justify-between text-xs font-semibold text-slate-800">
+                  <label htmlFor="delong-biological-signal">Additional Model B separation</label>
+                  <output htmlFor="delong-biological-signal" className="text-indigo-700 font-bold">
+                    +{biologicalSignal.toFixed(2)}
+                  </output>
+                </div>
+                <input
+                  id="delong-biological-signal"
+                  type="range"
+                  min="0"
+                  max="0.2"
+                  step="0.01"
+                  value={biologicalSignal}
+                  onChange={(e) => setBiologicalSignal(Number(e.target.value))}
+                  aria-describedby="delong-model-boundary"
+                  className="w-full accent-indigo-600"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex justify-between text-xs font-semibold text-slate-800">
+                  <label htmlFor="delong-sample-size">Paired holdout size</label>
+                  <output htmlFor="delong-sample-size" className="text-indigo-700 font-bold">
+                    n = {comparisonSampleSize}
+                  </output>
+                </div>
+                <input
+                  id="delong-sample-size"
+                  type="range"
+                  min="80"
+                  max="400"
+                  step="20"
+                  value={comparisonSampleSize}
+                  onChange={(e) => setComparisonSampleSize(Number(e.target.value))}
+                  aria-describedby="delong-model-boundary"
+                  className="w-full accent-indigo-600"
+                />
+                <span className="text-[10px] text-slate-600 leading-normal block font-medium">
+                  {stats.positiveCount} positives and {stats.negativeCount} negatives, evaluated by
+                  both models on exactly the same records.
+                </span>
+              </div>
+
+              <div className="space-y-1 text-xs border border-slate-200 rounded-lg p-3 bg-slate-50/50" aria-live="polite">
+                <div className="flex justify-between py-0.5">
+                  <span className="text-slate-600 font-semibold">Model A AUC (2D Morgan):</span>
+                  <span className="font-bold text-slate-900">{stats.aucA.toFixed(3)}</span>
+                </div>
+                <div className="flex justify-between py-0.5 border-t border-slate-100">
+                  <span className="text-slate-600 font-semibold">Model B AUC (Morgan+Bio):</span>
+                  <span className="font-bold text-indigo-700">{stats.aucB.toFixed(3)}</span>
+                </div>
+                <div className="flex justify-between py-0.5 border-t border-slate-100">
+                  <span className="text-slate-600 font-semibold">Difference in AUC:</span>
+                  <span className="font-bold text-slate-900">{stats.difference >= 0 ? "+" : ""}{stats.difference.toFixed(3)}</span>
+                </div>
+                <div className="flex justify-between py-0.5 border-t border-slate-100">
+                  <span className="text-slate-600 font-semibold">Paired DeLong z / p:</span>
+                  <span className="font-bold text-slate-900">{stats.zScore.toFixed(2)} / {pValueLabel}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Comparison results and validation display */}
+            <div className="md:col-span-7 flex flex-col justify-center">
+              <div className={`p-5 rounded-xl border flex flex-col items-center text-center space-y-3 ${
+                stats.significant
+                  ? "bg-emerald-50 border-emerald-200 text-emerald-950"
+                  : "bg-amber-50 border-amber-200 text-amber-950"
+              }`} role="status" aria-live="polite">
+                {stats.significant ? (
+                  <div>
+                    <CheckCircle className="mx-auto h-9 w-9 text-emerald-600" aria-hidden="true" />
+                    <h5 className="mt-2 font-bold text-sm">Difference detected in this paired sample</h5>
+                    <p className="text-xs text-emerald-800 leading-relaxed font-medium mt-1">
+                      The two-sided paired DeLong p-value is <strong>{pValueLabel}</strong>. This
+                      supports a difference between these two synthetic score vectors; it does not
+                      establish that Cell Painting will improve an external dataset.
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <AlertTriangle className="mx-auto h-9 w-9 text-amber-600" aria-hidden="true" />
+                    <h5 className="mt-2 font-bold text-sm">The holdout does not resolve a difference</h5>
+                    <p className="text-xs text-amber-800 leading-relaxed font-medium mt-1">
+                      The paired DeLong p-value is <strong>{pValueLabel}</strong>. Failing to reject
+                      equal AUCs is not proof of equivalence; inspect the effect size, confidence
+                      intervals, sample composition, and external validation.
+                    </p>
+                  </div>
+                )}
+
+                <div className="grid w-full grid-cols-1 gap-2 border-t border-current/10 pt-3 text-[11px] sm:grid-cols-2">
+                  <span>Model A 95% CI: [{stats.ciA[0].toFixed(3)}, {stats.ciA[1].toFixed(3)}]</span>
+                  <span>Model B 95% CI: [{stats.ciB[0].toFixed(3)}, {stats.ciB[1].toFixed(3)}]</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <p id="delong-model-boundary" className="rounded-lg bg-slate-50 p-3 text-[11px] leading-relaxed text-slate-700">
+            <strong>Simulation boundary:</strong> the records and prediction scores are deterministic
+            teaching data, not an experimental Cell Painting benchmark. The statistics are calculated
+            from those paired scores using DeLong placement values and covariance; real claims require
+            a locked external test set and endpoint-specific validation.
+          </p>
+        </div>
+      </section>
+
+      {/* Section 5: Limits */}
+      <section className="space-y-4">
+        <h2>5. What These Predictions Cannot Tell You</h2>
+        <p>
+          ADMET models are the most over-trusted tools in computational chemistry, because they return a clean probability for a question — <em>is this compound safe?</em> — that no model can actually answer. Four limits are worth carrying forward.
+        </p>
+
+        <div className="space-y-3 not-prose">
+          <div className="p-4 rounded-lg border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">A rule is an alert, not a verdict</h4>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              Lipinski and Veber describe tendencies in oral drugs, not requirements. Plenty of approved drugs violate them, and entire modalities — PROTACs, macrocycles, peptides — sit far outside that space by design. Use the rules to raise questions, never to close them.
+            </p>
+          </div>
+          <div className="p-4 rounded-lg border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">Toxicity models inherit their training sets</h4>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              A hERG or DILI classifier learned from historical compounds knows historical chemistry. Present it a novel chemotype and it will answer confidently from outside its applicability domain (Module 9). Check the domain before believing the probability.
+            </p>
+          </div>
+          <div className="p-4 rounded-lg border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">SHAP explains the model, not the biology</h4>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              A Shapley value tells you which features drove <em>this model&apos;s</em> output. If the model learned a dataset artefact, SHAP will explain the artefact fluently and persuasively. Attribution is not mechanism.
+            </p>
+          </div>
+          <div className="p-4 rounded-lg border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">Structure is not exposure</h4>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              Everything in this module is computed from a structure. Whether a compound reaches a harmful concentration at a sensitive tissue depends on dose, clearance, protein binding, and route — which is where Module 15 picks up.
+            </p>
+          </div>
+        </div>
+
+        <p className="text-sm text-slate-700">
+          Used well, these models reorder your synthesis queue and catch liabilities while they are still cheap to fix. Used as a pass/fail gate, they discard good compounds and wave through bad ones with equal confidence.
+        </p>
+      </section>
+
+      {/* Quiz Section */}
+      <hr className="border-slate-200 my-8" />
+      <section className="space-y-5">
+        <h2>Knowledge check</h2>
+        <Quiz 
+          moduleTitle="Module 12: In Silico ADMET & Safety Assessment"
+          questions={[
+            {
+              question: "Why is a basic tertiary nitrogen frequently flagged with a high positive SHAP value in predictive cardiotoxicity models?",
+              options: [
+                "Because basic tertiary nitrogens are highly electrophilic, reacting immediately with cellular DNA.",
+                "Because basic tertiary nitrogens form strong electrostatic salt bridges with Acid 189 in the active site of metabolic kinase receptors.",
+                "Because at physiological pH 7.4, the basic nitrogen is protonated and fits the hydrophobic/electrostatic inner cavity of the hERG channel, causing cardiotoxic blockade.",
+                "Because it prevents phase-I oxidation pathways, leading to direct cell painting degradation."
+              ],
+              correctIndex: 2,
+              explanation: "At physiological pH 7.4, basic tertiary nitrogens are protonated (positively charged). The hERG potassium channel possesses a large hydrophobic vestibule lined with negative electrostatic potential and aromatic residues (like Tyr652 and Phe656). The protonated nitrogen fits perfectly into this cavity, making it a critical toxicophore structural flag with massive positive SHAP impact in cardiotoxicity models."
+            },
+            {
+              question: "When comparing two ROC curves on the same chemical database, why is DeLong's test preferred over a standard independent t-test for comparing AUC scores?",
+              options: [
+                "Because DeLong's test does not require the calculation of true positive or false positive rates.",
+                "Because the predictions of two models tested on the exact same dataset are highly correlated (non-independent), requiring DeLong's z-score calculation to account for their covariance.",
+                "Because DeLong's test operates on a logarithmic scale, reducing the leverage of extreme chemical outliers.",
+                "Because DeLong's test is only valid for consensus models and cannot evaluate single Random Forests."
+              ],
+              correctIndex: 1,
+              explanation: "When evaluating Model A and Model B on the exact same dataset, their prediction profiles are highly correlated because they are responding to the same chemical space. A standard t-test assumes independent distributions, which would lead to an incorrect (inflated) standard error. DeLong's method computes the covariance of the correlated AUC estimates to calculate a valid z-score and diagnostic p-value."
+            },
+            {
+              question: "Which metabolic mechanism is primarily responsible for Acetaminophen (Paracetamol) hepatotoxicity, and how is it computationally classified?",
+              options: [
+                "Mutagenic DNA-alkylation, classified by searching for electrophilic aromatic nitro alerts in RDKit.",
+                "Metabolic conversion by cytochrome P450 into the reactive quinone-imine metabolite NAPQI, classified by modeling DILI endpoints with Random Forests.",
+                "hERG channel blockade, classified using support vector machine consensus regression.",
+                "Phase-II glucuronidation conjugation, classified using Cell Painting morphometry."
+              ],
+              correctIndex: 1,
+              explanation: "Acetaminophen is safe at standard therapeutic levels but at high concentrations, Cytochrome P450 enzymes oxidize it into NAPQI (N-acetyl-p-benzoquinone imine), a highly reactive quinone-imine that binds to liver proteins, generating toxic stress. DILI classifiers model this endpoint by identifying structural alerts linked to metabolic NAPQI formation and its subsequent hepatotoxicity."
+            }
+          ]}
+        />
+      </section>
+    </div>
+  );
+}

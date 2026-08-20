@@ -1,0 +1,1044 @@
+"use client";
+
+import React, { useCallback, useState, useRef, useEffect } from "react";
+import { 
+  Activity, 
+  Layers, 
+  Flame,
+  Zap
+} from "lucide-react";
+import { Quiz } from "@/components/Quiz";
+
+export default function LigandReceptorInteractionsPage() {
+  // Widget 1 state
+  const [distance, setDistance] = useState(3.5); 
+  const [desolvate, setDesolvate] = useState(false);
+
+  // Widget 3: Supramolecular Sandbox state
+  const [ligandPos, setLigandPos] = useState({ x: 130, y: 100 });
+  const [isDragging, setIsDragging] = useState(false);
+  const dragStartOffset = useRef({ x: 0, y: 0 });
+  const svgRef = useRef<SVGSVGElement | null>(null);
+
+  // Fixed receptor partner atom coordinates
+  const aspPos = { x: 60, y: 50 };     // Asp189 carboxylate oxygen
+  const hisPos = { x: 140, y: 155 };   // His41 imidazole nitrogen
+  const phePos = { x: 230, y: 75 };    // Phe140 phenyl ring center
+
+  // Ligand branch tip offsets relative to ligand center (when centered at (130, 95))
+  // We offset them slightly so that they don't all align perfectly at a single point, 
+  // introducing "conformational fit strain" which represents true drug design challenges.
+  const amineOffset = { dx: -65, dy: -40 };  // Amine group
+  const hydroxylOffset = { dx: 15, dy: 50 };  // Hydroxyl group
+  const phenylOffset = { dx: 85, dy: -20 };   // Phenyl ring
+
+  const aminePos = { x: ligandPos.x + amineOffset.dx, y: ligandPos.y + amineOffset.dy };
+  const hydroxylPos = { x: ligandPos.x + hydroxylOffset.dx, y: ligandPos.y + hydroxylOffset.dy };
+  const phenylPos = { x: ligandPos.x + phenylOffset.dx, y: ligandPos.y + phenylOffset.dy };
+
+  // Scale: 20 pixels = 1 Ångstrom
+  const pxToAngstrom = 20;
+
+  // Contact distance = sum of the *drawn* residue-sphere and ligand-group radii (in Å).
+  // A steric clash fires only when these circles actually overlap — i.e. the ligand
+  // touches the residue atom itself, never when it merely passes over the residue's
+  // text label, which sits outside the sphere.
+  const RESIDUE_R = { asp: 20, his: 20, phe: 22 };
+  const GROUP_R = { amine: 12, hydroxyl: 12, phenyl: 14 };
+  const contactAmine = (RESIDUE_R.asp + GROUP_R.amine) / pxToAngstrom;      // 1.6 Å
+  const contactHydroxyl = (RESIDUE_R.his + GROUP_R.hydroxyl) / pxToAngstrom; // 1.6 Å
+  const contactPhenyl = (RESIDUE_R.phe + GROUP_R.phenyl) / pxToAngstrom;    // 1.8 Å
+
+  const dAmine = Math.sqrt(Math.pow(aminePos.x - aspPos.x, 2) + Math.pow(aminePos.y - aspPos.y, 2)) / pxToAngstrom;
+  const dHydroxyl = Math.sqrt(Math.pow(hydroxylPos.x - hisPos.x, 2) + Math.pow(hydroxylPos.y - hisPos.y, 2)) / pxToAngstrom;
+  const dPhenyl = Math.sqrt(Math.pow(phenylPos.x - phePos.x, 2) + Math.pow(phenylPos.y - phePos.y, 2)) / pxToAngstrom;
+
+  // Energy functions (kcal/mol)
+  // Salt bridge (Amine - Asp189)
+  const getSaltBridgeEnergy = (d: number) => {
+    if (d < contactAmine) return 15; // steric clash (spheres overlap)
+    if (d < 5.0) {
+      // Morse-like potential representing electrostatic + short-range repulsion
+      const val = -6.0 * Math.exp(-Math.pow(d - 2.8, 2) / 0.8);
+      return val;
+    }
+    return 0;
+  };
+
+  // Hydrogen bond (Hydroxyl - His41)
+  const getHbondEnergy = (d: number) => {
+    if (d < contactHydroxyl) return 12; // steric clash (spheres overlap)
+    if (d < 4.0) {
+      const val = -3.5 * Math.exp(-Math.pow(d - 2.9, 2) / 0.3);
+      return val;
+    }
+    return 0;
+  };
+
+  // pi-pi Stacking (Phenyl - Phe140)
+  const getPiStackingEnergy = (d: number) => {
+    if (d < contactPhenyl) return 10; // steric clash (spheres overlap)
+    if (d < 5.5) {
+      const val = -2.2 * Math.exp(-Math.pow(d - 3.8, 2) / 0.5);
+      return val;
+    }
+    return 0;
+  };
+
+  const eAmine = getSaltBridgeEnergy(dAmine);
+  const eHydroxyl = getHbondEnergy(dHydroxyl);
+  const ePhenyl = getPiStackingEnergy(dPhenyl);
+
+  // Steric Clashes check — only when the ligand group circle overlaps the residue sphere
+  const clashAmine = dAmine < contactAmine;
+  const clashHydroxyl = dHydroxyl < contactHydroxyl;
+  const clashPhenyl = dPhenyl < contactPhenyl;
+  const hasClash = clashAmine || clashHydroxyl || clashPhenyl;
+
+  // Total Enthalpy (dH)
+  const dH = eAmine + eHydroxyl + ePhenyl;
+
+  // Entropy calculations
+  // Fixed conformational penalty for freezing rotatable bonds
+  const dSconf = 2.5; // kcal/mol equivalent (+TdS penalty)
+  
+  // Hydrophobic desolvation boost (favorable entropy -TdS when phenyl interacts with Phe140 pocket)
+  const dSdesolv = dPhenyl < 4.5 ? -3.0 * Math.exp(-Math.pow(dPhenyl - 3.8, 2) / 1.5) : 0;
+
+  const totalTdS = dSconf + dSdesolv;
+
+  // Gibbs Free Energy: dG = dH - TdS (here totalTdS is positive for penalties, negative for boosts)
+  const dG = dH + totalTdS;
+
+  // Binding Affinity Kd calculation (RT = 0.593 kcal/mol at 298K)
+  const getKdText = (dgVal: number) => {
+    if (hasClash) return "No Binding (Steric Clash)";
+    if (dgVal >= 0) return "No Binding (ΔG ≥ 0)";
+    const kdM = Math.exp(dgVal / 0.593); // Kd in M
+    if (kdM < 1e-9) {
+      return `${(kdM * 1e12).toFixed(1)} pM (Picomolar)`;
+    } else if (kdM < 1e-6) {
+      return `${(kdM * 1e9).toFixed(1)} nM (Nanomolar)`;
+    } else if (kdM < 1e-3) {
+      return `${(kdM * 1e6).toFixed(1)} µM (Micromolar)`;
+    } else {
+      return `${(kdM * 1e3).toFixed(1)} mM (Millimolar)`;
+    }
+  };
+
+  // Drag and drop handlers
+  const handleMouseDown = (e: React.MouseEvent<SVGCircleElement | SVGElement>) => {
+    if (!svgRef.current) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    // Calculate mouse position relative to SVG coordinates
+    const mouseX = ((e.clientX - rect.left) / rect.width) * 300;
+    const mouseY = ((e.clientY - rect.top) / rect.height) * 200;
+    
+    dragStartOffset.current = {
+      x: mouseX - ligandPos.x,
+      y: mouseY - ligandPos.y
+    };
+    setIsDragging(true);
+  };
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<SVGSVGElement> | MouseEvent) => {
+    if (!isDragging || !svgRef.current) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const clientX = 'clientX' in e ? e.clientX : (e as MouseEvent).clientX;
+    const clientY = 'clientY' in e ? e.clientY : (e as MouseEvent).clientY;
+    
+    const mouseX = ((clientX - rect.left) / rect.width) * 300;
+    const mouseY = ((clientY - rect.top) / rect.height) * 200;
+
+    let newX = mouseX - dragStartOffset.current.x;
+    let newY = mouseY - dragStartOffset.current.y;
+
+    // Constrain within visible viewport boundaries
+    newX = Math.min(Math.max(newX, 70), 190);
+    newY = Math.min(Math.max(newY, 50), 150);
+
+    setLigandPos({ x: newX, y: newY });
+  }, [isDragging]);
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false);
+  }, []);
+
+  // Touch support for mobile devices
+  const handleTouchStart = (e: React.TouchEvent<SVGCircleElement | SVGElement>) => {
+    if (!svgRef.current || e.touches.length === 0) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const touch = e.touches[0];
+    const mouseX = ((touch.clientX - rect.left) / rect.width) * 300;
+    const mouseY = ((touch.clientY - rect.top) / rect.height) * 200;
+    
+    dragStartOffset.current = {
+      x: mouseX - ligandPos.x,
+      y: mouseY - ligandPos.y
+    };
+    setIsDragging(true);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<SVGSVGElement>) => {
+    if (!isDragging || !svgRef.current || e.touches.length === 0) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const touch = e.touches[0];
+    const mouseX = ((touch.clientX - rect.left) / rect.width) * 300;
+    const mouseY = ((touch.clientY - rect.top) / rect.height) * 200;
+
+    let newX = mouseX - dragStartOffset.current.x;
+    let newY = mouseY - dragStartOffset.current.y;
+
+    newX = Math.min(Math.max(newX, 70), 190);
+    newY = Math.min(Math.max(newY, 50), 150);
+
+    setLigandPos({ x: newX, y: newY });
+  };
+
+  useEffect(() => {
+    if (isDragging) {
+      window.addEventListener("mouseup", handleMouseUp);
+      window.addEventListener("mousemove", handleMouseMove);
+    }
+    return () => {
+      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("mousemove", handleMouseMove);
+    };
+  }, [handleMouseMove, handleMouseUp, isDragging]);
+
+  const calculateEnergy = (r: number) => {
+    const r0 = 2.9;     // equilibrium donor–acceptor distance (Å)
+    const depth = 4.0;  // well depth ε (kcal/mol); attraction is negative
+    // Minimized 12-6 form: V(r0) = -ε at the minimum, → 0 at large r, → +∞ at short r
+    const term12 = Math.pow(r0 / r, 12);
+    const term6 = 2 * Math.pow(r0 / r, 6);
+    const energy = depth * (term12 - term6);
+    // Clamp the steep repulsive wall to +8 so it stays inside the chart viewBox
+    return Math.min(Math.max(energy, -depth), 8);
+  };
+
+  const currentEnergy = calculateEnergy(distance);
+
+  const generateCurvePath = () => {
+    let path = "M";
+    for (let r = 2.0; r <= 6.0; r += 0.05) {
+      const x = 50 + (r - 2.0) * 60; 
+      const energy = calculateEnergy(r);
+      const y = 80 - energy * 10; 
+      path += `${r === 2.0 ? "" : " L"}${x},${y}`;
+    }
+    return path;
+  };
+
+  return (
+    <div className="space-y-8">
+      {/* Header */}
+      <div>
+        <h1>Module 3: Fundamentals of Ligand-Receptor Interactions</h1>
+        <p className="lead text-slate-800">
+          Analyze the energetic drivers behind ligand binding. Explore Gibbs free energy, calculate potential energy curves, and inspect the structural basis of the hydrophobic effect.
+        </p>
+      </div>
+
+      <hr className="border-slate-200" />
+
+      {/* Learning outcomes */}
+      <section className="rounded-xl border border-border bg-surface p-5 space-y-2">
+        <h2 className="!mt-0 !text-base font-bold">Learning outcomes</h2>
+        <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1 leading-relaxed">
+          <li>Decompose binding free energy into enthalpic and entropic contributions.</li>
+          <li>Identify the major non-covalent interactions and their characteristic geometries.</li>
+          <li>Explain the hydrophobic effect and why desolvation can dominate an affinity change.</li>
+          <li>Use ligand efficiency and LLE to compare hits of different sizes and lipophilicities.</li>
+          <li>Name the four ways the pairwise-contact picture of binding breaks down.</li>
+        </ul>
+      </section>
+
+      {/* Section 1: Recognition Models */}
+      <section className="space-y-4">
+        <h2>1. Molecular Recognition Models</h2>
+        <p>
+          How do a drug molecule and its target protein recognize each other in a crowded biological environment? Two classical theories explain this process:
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 not-prose">
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1">
+            <h3 className="font-bold text-sm text-slate-900">Lock-and-Key Model</h3>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              Formulated by Emil Fischer in 1894. Suggests the receptor and ligand possess complementary, rigid geometries. It explains high specificity but fails to account for structural plasticity.
+            </p>
+          </div>
+          <div className="p-4 rounded-xl border border-border bg-white space-y-1">
+            <h3 className="font-bold text-sm text-slate-900">Induced-Fit Model</h3>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              Proposed by Daniel Koshland in 1958. Proposes that ligand binding triggers conformational rearrangements in the receptor pocket to optimize contacts, matching thermodynamic realities.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Section 2: Thermodynamics */}
+      <section className="space-y-4">
+        <h2>2. Thermodynamics of Binding</h2>
+        <p>
+          The affinity of a ligand for its receptor is defined by the change in Gibbs Free Energy (ΔG) upon complex formation. A more negative ΔG corresponds to tighter binding (higher affinity):
+        </p>
+        
+        <div className="flex flex-col items-center justify-center p-5 bg-slate-50 border border-slate-200 rounded-xl select-none my-2 not-prose">
+          <div className="text-2xl font-mono font-bold tracking-wider text-slate-900">
+            ΔG = ΔH - TΔS
+          </div>
+          <div className="text-sm text-slate-800 font-bold uppercase tracking-widest mt-1">
+             Gibbs Free Energy Equation
+          </div>
+        </div>
+
+        <p className="pt-2">
+          Gibbs Free Energy change is directly related to the binding dissociation constant (<em>K_d</em>) by the fundamental thermodynamic equilibrium equation:
+        </p>
+
+        <div className="flex flex-col items-center justify-center p-5 bg-slate-50 border border-slate-200 rounded-xl select-none my-2 not-prose">
+          <div className="text-2xl font-mono font-bold tracking-wider text-slate-900">
+            ΔG = R × T × ln(K_d)
+          </div>
+          <div className="text-sm text-slate-800 font-bold uppercase tracking-widest mt-1">
+             Relationship to Equilibrium Dissociation Constant
+          </div>
+        </div>
+
+        <p className="text-sm text-slate-800 leading-relaxed">
+          Where <em>R</em> is the gas constant and <em>T</em> is the absolute temperature. Because of this logarithmic relationship, small, linear changes in Gibbs Free Energy translate into exponential improvements in binding affinity:
+        </p>
+
+        <div className="overflow-x-auto not-prose border border-slate-200 rounded-lg my-2">
+          <table className="min-w-full divide-y divide-slate-200 text-sm">
+            <thead className="bg-slate-50">
+              <tr>
+                <th className="px-4 py-2 text-left font-bold text-slate-900">ΔG (at 298 K)</th>
+                <th className="px-4 py-2 text-left font-bold text-slate-900">Affinity Constant (K_d)</th>
+                <th className="px-4 py-2 text-left font-bold text-slate-900">Qualitative Description</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-200 bg-white text-slate-800">
+              <tr>
+                <td className="px-4 py-2 font-mono font-semibold">-4.1 kcal/mol</td>
+                <td className="px-4 py-2 font-mono">1.0 mM (Millimolar)</td>
+                <td className="px-4 py-2 text-slate-600">Very weak binding, typical of small fragments.</td>
+              </tr>
+              <tr>
+                <td className="px-4 py-2 font-mono font-semibold">-8.2 kcal/mol</td>
+                <td className="px-4 py-2 font-mono">1.0 µM (Micromolar)</td>
+                <td className="px-4 py-2 text-indigo-700">Moderate binding, typical of high-throughput screen hits.</td>
+              </tr>
+              <tr>
+                <td className="px-4 py-2 font-mono font-semibold">-12.3 kcal/mol</td>
+                <td className="px-4 py-2 font-mono">1.0 nM (Nanomolar)</td>
+                <td className="px-4 py-2 text-emerald-700 font-semibold">Tightly bound drug candidate.</td>
+              </tr>
+              <tr>
+                <td className="px-4 py-2 font-mono font-semibold">-16.4 kcal/mol</td>
+                <td className="px-4 py-2 font-mono">1.0 pM (Picomolar)</td>
+                <td className="px-4 py-2 text-purple-700 font-semibold">Exceptional affinity binding, rare and highly optimized.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 not-prose">
+          <div className="space-y-1">
+            <h3 className="font-bold text-sm text-slate-900 flex items-center gap-1.5"><Flame size={14} className="text-red-500" /> Enthalpy (ΔH)</h3>
+            <p className="text-sm leading-relaxed text-slate-800">
+              Refers to the release of heat resulting from the formation of specific, directional non-covalent contacts (hydrogen bonds, ionic pairs, van der Waals, and halogen bonds) between the ligand and target.
+            </p>
+          </div>
+          <div className="space-y-1">
+            <h3 className="font-bold text-sm text-slate-900 flex items-center gap-1.5"><Activity size={14} className="text-blue-500" /> Entropy (-TΔS)</h3>
+            <p className="text-sm leading-relaxed text-slate-800">
+              Represents the change in disorder. Complexation restricts ligand and side-chain rotation, costing conformational entropy. However, this penalty is offset by the <strong>hydrophobic effect</strong>: water displacement from hydrophobic surfaces into bulk.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Interactive Widget 1: Bond energy curve */}
+      <section className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-4">
+        <div className="flex items-center gap-2">
+          <Activity size={16} className="text-slate-900" />
+          <h3 className="font-bold text-sm text-slate-900">Interactive Playground: Distance-Dependent H-Bond Potential</h3>
+        </div>
+        <p className="text-sm text-slate-800">
+          Adjust the distance slider to bring the Hydrogen Bond donor atom closer to the acceptor. Watch the energy shift along the potential curve.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-center bg-white p-5 rounded-lg border border-slate-200">
+          
+          {/* Slider & Meter */}
+          <div className="md:col-span-5 space-y-4">
+            <div className="space-y-1">
+              <div className="flex justify-between items-center text-sm text-slate-800 font-bold">
+                <label htmlFor="hbond-distance">Donor-acceptor distance (Å)</label>
+                <output htmlFor="hbond-distance" className="font-bold text-slate-900">{distance.toFixed(2)} Å</output>
+              </div>
+              <input
+                id="hbond-distance"
+                type="range"
+                min="1.8"
+                max="5.5"
+                step="0.05"
+                value={distance}
+                onChange={(e) => setDistance(parseFloat(e.target.value))}
+                aria-describedby="hbond-model-boundary"
+                className="w-full h-1.5 bg-slate-100 rounded appearance-none cursor-pointer accent-slate-900"
+              />
+            </div>
+
+            <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-1.5">
+              <span className="text-sm text-slate-800 font-bold uppercase tracking-wider block">Calculated Energy</span>
+              <p className="text-xl font-bold text-slate-950">
+                {currentEnergy.toFixed(2)}
+                <span className="text-sm text-slate-800 font-medium ml-1">kcal/mol</span>
+              </p>
+              <div className="text-sm leading-normal text-slate-800">
+                {distance < 2.3 ? (
+                  <span className="text-red-700 font-bold">Steric Clashes: Atoms are too close (repulsion)!</span>
+                ) : distance >= 2.7 && distance <= 3.2 ? (
+                  <span className="text-emerald-700 font-bold">Optimal Hydrogen Bond formed! (Stable Enthalpy)</span>
+                ) : (
+                  <span>Weak interaction. Atoms are too far apart.</span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Interactive Graph SVG */}
+          <div className="md:col-span-7 flex justify-center">
+            <div className="w-full max-w-[280px] aspect-square relative bg-slate-50 border border-slate-200 rounded-lg p-4 flex flex-col justify-between">
+              
+              <div className="relative flex-1">
+                <svg
+                  viewBox="0 0 300 200"
+                  className="w-full h-full"
+                  role="img"
+                  aria-label={`Illustrative hydrogen-bond distance potential at ${distance.toFixed(2)} angstroms and ${currentEnergy.toFixed(2)} kilocalories per mole`}
+                >
+                  <line x1="0" y1="80" x2="300" y2="80" stroke="currentColor" className="text-slate-300" strokeWidth="0.5" strokeDasharray="3,3" />
+                  
+                  {/* Energy Curve Path */}
+                  <path d={generateCurvePath()} fill="none" stroke="currentColor" className="text-slate-900" strokeWidth="1.8" />
+                  
+                  {/* Active Point marker */}
+                  {(() => {
+                    const x = 50 + (distance - 2.0) * 60;
+                    const y = 80 - currentEnergy * 10;
+                    return (
+                      <g>
+                        <circle cx={x} cy={y} r="4" fill="currentColor" className="text-slate-900" stroke="currentColor" strokeWidth="1" />
+                      </g>
+                    );
+                  })()}
+                  
+                  {/* Annotations */}
+                  <text x="10" y="72" fill="#1e293b" className="text-sm font-bold fill-slate-800" fontSize="10">0 Energy (Unbound)</text>
+                  <text x="230" y="92" fill="#1e293b" className="text-sm font-bold fill-slate-800" fontSize="10">Distance (r)</text>
+                  <text x="10" y="20" fill="#1e293b" className="text-sm font-bold fill-slate-800" fontSize="10">Repulsion (+V)</text>
+                  <text x="10" y="180" fill="#1e293b" className="text-sm font-bold fill-slate-800" fontSize="10">Attraction (-V)</text>
+                </svg>
+              </div>
+
+              <div className="text-sm text-center text-slate-800 font-bold mt-1">
+                Illustrative radial interaction potential
+              </div>
+            </div>
+          </div>
+        </div>
+        <p id="hbond-model-boundary" className="text-xs leading-relaxed text-slate-600">
+          This 12-6 radial potential is a teaching approximation for short-range repulsion and an
+          attractive well. Real hydrogen-bond strength also depends on donor-acceptor angle,
+          protonation, solvent, and the surrounding electrostatic field.
+        </p>
+      </section>
+
+      {/* Section 3: Medicinal-chemistry efficiency metrics */}
+      <section className="space-y-4">
+        <h2>3. From Affinity to Design Efficiency</h2>
+        <p>
+          Potency is essential, but it does not show what a molecule had to become to achieve that
+          potency. Medicinal chemists use efficiency metrics and thermodynamic measurements to
+          compare compounds while tracking size, lipophilicity, and binding mechanism.
+        </p>
+
+        <div className="overflow-x-auto not-prose rounded-xl border border-slate-200 bg-white shadow-sm">
+          <table className="min-w-full divide-y divide-slate-200 text-sm">
+            <thead className="bg-slate-50">
+              <tr>
+                <th className="px-4 py-3 text-left font-bold text-slate-900">Measure</th>
+                <th className="px-4 py-3 text-left font-bold text-slate-900">What it adds</th>
+                <th className="px-4 py-3 text-left font-bold text-slate-900">Important limit</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-slate-800">
+              <tr>
+                <td className="px-4 py-3 align-top font-bold text-slate-950">Ligand efficiency (LE)</td>
+                <td className="px-4 py-3 align-top">Relates binding free energy to non-hydrogen atom count, helping compare differently sized hits.</td>
+                <td className="px-4 py-3 align-top">Size normalization has known biases; compare related series and use the same affinity endpoint.</td>
+              </tr>
+              <tr>
+                <td className="px-4 py-3 align-top font-bold text-slate-950">Lipophilic ligand efficiency (LLE or LipE)</td>
+                <td className="px-4 py-3 align-top"><span className="font-mono">pActivity - logD</span> asks whether potency rises faster than lipophilicity.</td>
+                <td className="px-4 py-3 align-top">State the assay endpoint, pH, and lipophilicity measure. The octanol-water reference is useful, not a universal measure of specificity.</td>
+              </tr>
+              <tr>
+                <td className="px-4 py-3 align-top font-bold text-slate-950">Isothermal titration calorimetry (ITC)</td>
+                <td className="px-4 py-3 align-top">A titration can estimate affinity, stoichiometry, and binding enthalpy; entropy is inferred from the free-energy relationship.</td>
+                <td className="px-4 py-3 align-top">Buffer ionization, proton transfer, concentration accuracy, and coupled conformational changes can affect the observed heat.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div className="not-prose grid gap-4 md:grid-cols-2">
+          <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h3 className="text-sm font-extrabold text-slate-950">Enthalpy-entropy compensation</h3>
+            <p className="mt-2 text-sm leading-relaxed text-slate-700">
+              Two ligands can have similar affinity with different enthalpic and entropic profiles.
+              Solvent reorganization, protonation, and conformational change couple the terms, so an
+              apparently favorable enthalpy does not automatically identify a better lead.
+            </p>
+          </article>
+          <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h3 className="text-sm font-extrabold text-slate-950">Water is part of the mechanism</h3>
+            <p className="mt-2 text-sm leading-relaxed text-slate-700">
+              Displacing an unfavorable water can help binding, while disrupting a stable bridging
+              network can hurt it. Inspect water networks and receptor state instead of treating every
+              buried water release as an automatic gain.
+            </p>
+          </article>
+        </div>
+
+        <aside className="not-prose rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-relaxed text-amber-950">
+          <strong>Use a panel, not a single winning metric:</strong> track potency, LE or LLE,
+          solubility, permeability, clearance, selectivity, and assay quality together. Optimizing one
+          composite score can hide trade-offs or amplify measurement noise.
+        </aside>
+      </section>
+
+      {/* Section 4: Non-covalent Interactions */}
+      <section className="space-y-4">
+        <h2>4. Types of Non-Covalent Interactions</h2>
+
+        <p className="text-sm text-slate-800 leading-relaxed">
+          Each interaction below is a physical phenomenon first and a line of arithmetic second. Module 4 shows how a force field turns them into computable terms — hydrogen bonds and salt bridges fall out of the Coulomb term, dispersion and steric clash out of the Lennard-Jones term — and every docking score (Module 6) and free-energy estimate (Module 10) you meet later is built from exactly these contributions.
+        </p>
+
+        <div className="space-y-3 not-prose">
+          <div className="flex gap-3 p-3.5 rounded-lg border border-border bg-white">
+            <span className="h-5 w-5 text-sm font-bold bg-slate-100 border border-border rounded flex items-center justify-center flex-shrink-0 text-slate-900">1</span>
+            <div>
+              <h4 className="font-bold text-sm text-slate-900">Hydrogen Bonds</h4>
+              <p className="text-sm text-slate-800 mt-0.5 leading-relaxed">
+                Formed between a hydrogen atom covalently bound to an electronegative atom (Donor: O-H, N-H) and another electronegative atom with lone pairs (Acceptor: O, N). Strong, highly directional, with typical optimal donor-acceptor distances of <strong>2.7–3.2 Å</strong> and bond angles close to <strong>180°</strong>.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-3 p-3.5 rounded-lg border border-border bg-white">
+            <span className="h-5 w-5 text-sm font-bold bg-slate-100 border border-border rounded flex items-center justify-center flex-shrink-0 text-slate-900">2</span>
+            <div>
+              <h4 className="font-bold text-sm text-slate-900">Halogen Bonds (σ-Hole Interactions)</h4>
+              <p className="text-sm text-slate-800 mt-0.5 leading-relaxed">
+                An interaction between an electronegative atom and the electropositive region on the tip of a halogen atom (Cl, Br, or I) bound to carbon. This positive region, known as the <strong>σ-hole</strong>, renders halogen bonds highly directional.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-3 p-3.5 rounded-lg border border-border bg-white">
+            <span className="h-5 w-5 text-sm font-bold bg-slate-100 border border-border rounded flex items-center justify-center flex-shrink-0 text-slate-900">3</span>
+            <div>
+              <h4 className="font-bold text-sm text-slate-900">Electrostatic Interactions</h4>
+              <p className="text-sm text-slate-800 mt-0.5 leading-relaxed">
+                Salt bridges formed between oppositely charged functional groups (e.g. protonated amine on ligand and carboxylate side-chain of Aspartate or Glutamate on receptor). These interactions are long-range (V ∝ 1/r).
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-3 p-3.5 rounded-lg border border-border bg-white">
+            <span className="h-5 w-5 text-sm font-bold bg-slate-100 border border-border rounded flex items-center justify-center flex-shrink-0 text-slate-900">4</span>
+            <div>
+              <h4 className="font-bold text-sm text-slate-900">Cation-π Interactions</h4>
+              <p className="text-sm text-slate-800 mt-0.5 leading-relaxed">
+                A special ion-dipole interaction between a cation (e.g. a protonated amine, Lys-NH₃⁺, or Arg guanidinium) and the electron-rich π face of an aromatic ring. Because the effect depends on ring electron density, <strong>electron-donating</strong> substituents (e.g. -NH₂) strengthen it while <strong>electron-withdrawing</strong> groups (e.g. -CN) weaken it. This explains why electron-rich Trp and Tyr engage in cation-π contacts far more often than Phe.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-3 p-3.5 rounded-lg border border-border bg-white">
+            <span className="h-5 w-5 text-sm font-bold bg-slate-100 border border-border rounded flex items-center justify-center flex-shrink-0 text-slate-900">5</span>
+            <div>
+              <h4 className="font-bold text-sm text-slate-900">Van der Waals / London Dispersion & π-π Stacking</h4>
+              <p className="text-sm text-slate-800 mt-0.5 leading-relaxed">
+                Weak (~0.5–1 kcal/mol each), short-range forces from transient, induced dipoles between all atoms in close contact. Individually negligible, but summed over a well-packed binding pocket they contribute substantially to affinity — this is the energetic basis of shape complementarity. <strong>π-π stacking</strong> between aromatic rings (parallel-displaced or T-shaped, ~3.5–4.0 Å) is a directional special case.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Interactive Widget 2: Desolvation Cage */}
+      <section className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-4">
+        <div className="flex items-center gap-2">
+          <Layers size={16} className="text-slate-900" />
+          <h3 className="font-bold text-sm text-slate-900">Interactive Playground: Hydrophobic Effect & Desolvation</h3>
+        </div>
+        <p className="text-sm text-slate-800">
+          Toggle the &quot;Bind Ligand&quot; button to push a lipophilic compound into a hydrophobic pocket. The slate circles illustrate interfacial waters that can be released into bulk solution when nonpolar surfaces are buried.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-center bg-white p-5 rounded-lg border border-slate-200">
+          
+          {/* Simulation Viewport */}
+          <div className="md:col-span-6 flex justify-center">
+            <div className="w-full max-w-[240px] aspect-square relative bg-slate-50 border border-slate-200 rounded-lg p-4 flex flex-col justify-center items-center">
+              <svg role="img" aria-label="Desolvation diagram: ordered water molecules released from a hydrophobic surface as the ligand binds." viewBox="0 0 100 100" className="w-full h-full">
+                <path d="M10,20 L30,20 C35,45 65,45 70,20 L90,20 L90,80 L10,80 Z" fill="currentColor" className="text-slate-200" stroke="currentColor" strokeWidth="1" />
+                <text x="50" y="70" textAnchor="middle" fill="currentColor" className="text-slate-800 font-bold" fontSize="5" fontWeight="semibold">HYDROPHOBIC POCKET</text>
+
+                {/* Structured Water molecules around pocket when NOT bound */}
+                {!desolvate && (
+                  <>
+                    <circle cx="35" cy="30" r="2" fill="currentColor" className="text-slate-400" />
+                    <circle cx="45" cy="35" r="2" fill="currentColor" className="text-slate-400" />
+                    <circle cx="55" cy="35" r="2" fill="currentColor" className="text-slate-400" />
+                    <circle cx="65" cy="30" r="2" fill="currentColor" className="text-slate-400" />
+                  </>
+                )}
+
+                {/* Ligand */}
+                <g className="transition-transform duration-500 ease-in-out" style={{ transform: desolvate ? 'translate(0px, 15px)' : 'translate(0px, -20px)' }}>
+                  <polygon points="50,22 55,30 45,30" fill="currentColor" className="text-slate-800" stroke="currentColor" strokeWidth="0.8" />
+                  <circle cx="50" cy="22" r="2" fill="currentColor" className="text-slate-900" />
+                  
+                  {/* Structured Water around Ligand when unbound */}
+                  {!desolvate && (
+                    <>
+                      <circle cx="42" cy="18" r="1.5" fill="currentColor" className="text-slate-400" />
+                      <circle cx="58" cy="18" r="1.5" fill="currentColor" className="text-slate-400" />
+                      <circle cx="50" cy="12" r="1.5" fill="currentColor" className="text-slate-400" />
+                    </>
+                  )}
+                </g>
+
+                {/* Disordered water molecules floating away when bound */}
+                {desolvate && (
+                  <>
+                    <circle cx="20" cy="15" r="2" fill="currentColor" className="text-slate-400" opacity="0.4" />
+                    <circle cx="80" cy="15" r="2" fill="currentColor" className="text-slate-400" opacity="0.4" />
+                    <circle cx="15" cy="35" r="2" fill="currentColor" className="text-slate-400" opacity="0.4" />
+                    <circle cx="85" cy="35" r="2" fill="currentColor" className="text-slate-400" opacity="0.4" />
+                  </>
+                )}
+              </svg>
+            </div>
+          </div>
+
+          <div className="md:col-span-6 space-y-4 not-prose">
+            <div className="space-y-2">
+              <h4 className="font-bold text-xs uppercase tracking-wider text-slate-800">Thermodynamic Analysis</h4>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="p-2.5 bg-white border border-border rounded-lg">
+                  <span className="text-xs text-slate-800 font-bold block uppercase">Conformational Entropy</span>
+                  <span className="text-sm font-semibold text-slate-900">-TΔS (Unfavorable)</span>
+                </div>
+                <div className="p-2.5 bg-white border border-border rounded-lg">
+                  <span className="text-xs text-slate-800 font-bold block uppercase">Solvent Entropy</span>
+                  <span className={`text-sm font-bold ${desolvate ? "text-slate-900 animate-pulse" : "text-slate-800"}`}>
+                    {desolvate ? "+TΔS (Favorable!)" : "0 (Water Caged)"}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <p className="text-sm text-slate-800 leading-relaxed">
+              {desolvate 
+                ? "The non-polar surfaces of both the pocket and the ligand associate. The rigid hydration shell collapses, and ordered water molecules are returned to the bulk solution. This gains considerable entropy, driving the binding process." 
+                : "Both the hydrophobic pocket and the lipophilic ligand are surrounded by highly organized, 'caged' water structures. This localized structure is translationally and rotationally restricted, resulting in low system entropy."}
+            </p>
+
+            <button
+              type="button"
+              onClick={() => setDesolvate(!desolvate)}
+              aria-pressed={desolvate}
+              className="px-4 py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-semibold text-sm transition-colors w-full text-center shadow-sm"
+            >
+              {desolvate ? "Unbind Ligand (Reset)" : "Bind Ligand (Release Caged Waters)"}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {/* Interactive Widget 3: The Supramolecular Binding Sandbox */}
+      <section className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-4">
+        <div className="flex items-center gap-2">
+          <Zap size={18} className="text-slate-900" />
+          <h3 className="font-bold text-base text-slate-900">Interactive Playground: The Supramolecular Binding Sandbox</h3>
+        </div>
+        <p className="text-sm text-slate-800">
+          In physical drug discovery, binding affinity depends on matching multiple functional groups simultaneously. 
+          <strong> Drag the central ligand core</strong> (or use the coordinates sliders) to align the three chemical arms with their target pocket residues. Watch the Gibbs Free Energy update live. 
+          <em> Note: Aligning all three perfectly is restricted by scaffold geometry; you must resolve the conformational strain trade-off to minimize ΔG!</em>
+        </p>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 bg-white p-5 rounded-lg border border-slate-200">
+          
+          {/* Interactive SVG Sandbox */}
+          <div className="lg:col-span-7 flex flex-col items-center">
+            <div className="w-full relative bg-slate-100 border border-slate-200 rounded-lg p-2 overflow-hidden select-none">
+              <svg 
+                ref={svgRef}
+                role="img"
+                aria-label="Supramolecular binding sandbox: a draggable ligand core with amine, hydroxyl and phenyl groups positioned against aspartate, histidine and phenylalanine residues."
+                viewBox="0 0 300 200" 
+                className="w-full h-auto cursor-default touch-none"
+                onMouseMove={handleMouseMove}
+                onTouchMove={handleTouchMove}
+              >
+                {/* Pocket Residues */}
+                {/* 1. Asp189 Carboxylate */}
+                <g transform={`translate(${aspPos.x}, ${aspPos.y})`}>
+                  <circle r="20" fill="#fee2e2" stroke="#ef4444" strokeWidth="1.5" />
+                  <circle r="4" fill="#ef4444" />
+                  <text y="-25" textAnchor="middle" className="fill-red-800 text-[7.5px] font-bold dark:fill-red-300">Asp189 (COO⁻)</text>
+                  <text y="3" textAnchor="middle" fill="#ef4444" className="text-[9px] font-extrabold font-mono">-</text>
+                </g>
+
+                {/* 2. His41 Nitrogen */}
+                <g transform={`translate(${hisPos.x}, ${hisPos.y})`}>
+                  <circle r="20" fill="#e0f2fe" stroke="#0284c7" strokeWidth="1.5" />
+                  <circle r="4" fill="#0284c7" />
+                  <text y="28" textAnchor="middle" className="fill-sky-700 text-[7.5px] font-bold dark:fill-sky-300">His41 (Imidazole-NH)</text>
+                </g>
+
+                {/* 3. Phe140 Stacking Pocket */}
+                <g transform={`translate(${phePos.x}, ${phePos.y})`}>
+                  <circle r="22" fill="#f1f5f9" stroke="#64748b" strokeWidth="1.5" strokeDasharray="3,2" />
+                  <polygon points="230,67 241,71 241,80 230,84 219,80 219,71" fill="#e2e8f0" stroke="#475569" strokeWidth="1" transform={`translate(-${phePos.x}, -${phePos.y})`} />
+                  <text y="-27" textAnchor="middle" className="fill-slate-700 text-[7.5px] font-bold dark:fill-slate-200">Phe140 (Benzene Pi)</text>
+                </g>
+
+                {/* Interaction Lines */}
+                {/* Amine - Asp189 interaction (dashed electrostatic) */}
+                {dAmine < 5.0 && !clashAmine && (
+                  <line 
+                    x1={aminePos.x} y1={aminePos.y} 
+                    x2={aspPos.x} y2={aspPos.y} 
+                    stroke="#ef4444" 
+                    strokeWidth="1.5" 
+                    strokeDasharray="3,3" 
+                  />
+                )}
+                {/* Hydroxyl - His41 interaction (dashed H-bond) */}
+                {dHydroxyl < 4.0 && !clashHydroxyl && (
+                  <line 
+                    x1={hydroxylPos.x} y1={hydroxylPos.y} 
+                    x2={hisPos.x} y2={hisPos.y} 
+                    stroke="#0284c7" 
+                    strokeWidth="1.5" 
+                    strokeDasharray="4,2" 
+                  />
+                )}
+                {/* Phenyl - Phe140 interaction (parallel stacking lines) */}
+                {dPhenyl < 5.5 && !clashPhenyl && (
+                  <g>
+                    <line 
+                      x1={phenylPos.x - 6} y1={phenylPos.y + 4} 
+                      x2={phePos.x - 6} y2={phePos.y + 4} 
+                      stroke="#10b981" 
+                      strokeWidth="1" 
+                    />
+                    <line 
+                      x1={phenylPos.x + 6} y1={phenylPos.y - 4} 
+                      x2={phePos.x + 6} y2={phePos.y - 4} 
+                      stroke="#10b981" 
+                      strokeWidth="1" 
+                    />
+                  </g>
+                )}
+
+                {/* Ligand Drawing */}
+                {/* Center connector lines */}
+                <line x1={ligandPos.x} y1={ligandPos.y} x2={aminePos.x} y2={aminePos.y} className="stroke-slate-800 dark:stroke-slate-100" strokeWidth="2.5" />
+                <line x1={ligandPos.x} y1={ligandPos.y} x2={hydroxylPos.x} y2={hydroxylPos.y} className="stroke-slate-800 dark:stroke-slate-100" strokeWidth="2.5" />
+                <line x1={ligandPos.x} y1={ligandPos.y} x2={phenylPos.x} y2={phenylPos.y} className="stroke-slate-800 dark:stroke-slate-100" strokeWidth="2.5" />
+
+                {/* 1. Amine tip (-NH3+) */}
+                <g transform={`translate(${aminePos.x}, ${aminePos.y})`}>
+                  <circle r="12" fill="#dbeafe" stroke="#2563eb" strokeWidth="1.5" />
+                  <text y="3.5" textAnchor="middle" fill="#1d4ed8" className="text-[7px] font-extrabold font-mono">NH₃⁺</text>
+                  {clashAmine && <circle r="12" fill="none" stroke="#ef4444" strokeWidth="2" className="animate-ping" />}
+                </g>
+
+                {/* 2. Hydroxyl tip (-OH) */}
+                <g transform={`translate(${hydroxylPos.x}, ${hydroxylPos.y})`}>
+                  <circle r="12" fill="#ffe4e6" stroke="#e11d48" strokeWidth="1.5" />
+                  <text y="3" textAnchor="middle" fill="#be123c" className="text-[8px] font-extrabold font-mono">OH</text>
+                  {clashHydroxyl && <circle r="12" fill="none" stroke="#ef4444" strokeWidth="2" className="animate-ping" />}
+                </g>
+
+                {/* 3. Phenyl tip */}
+                <g transform={`translate(${phenylPos.x}, ${phenylPos.y})`}>
+                  <circle r="14" fill="#ecfdf5" stroke="#059669" strokeWidth="1.5" />
+                  {/* Hexagon icon */}
+                  <polygon points="0,-8 7,-4 7,4 0,8 -7,4 -7,-4" fill="none" stroke="#059669" strokeWidth="1" />
+                  <circle r="3" fill="none" stroke="#059669" strokeWidth="0.5" />
+                  {clashPhenyl && <circle r="14" fill="none" stroke="#ef4444" strokeWidth="2" className="animate-ping" />}
+                </g>
+
+                {/* Core drag handle */}
+                <circle 
+                  cx={ligandPos.x} 
+                  cy={ligandPos.y} 
+                  r="12" 
+                  className="cursor-grab fill-slate-900 stroke-slate-700 active:cursor-grabbing hover:fill-slate-800 dark:fill-slate-100 dark:stroke-white dark:hover:fill-slate-300"
+                  strokeWidth="2" 
+                  onMouseDown={handleMouseDown}
+                  onTouchStart={handleTouchStart}
+                />
+                <circle 
+                  cx={ligandPos.x} 
+                  cy={ligandPos.y} 
+                  r="5" 
+                  opacity="0.7"
+                  className="pointer-events-none fill-white dark:fill-slate-900"
+                />
+                <text x={ligandPos.x} y={ligandPos.y - 16} textAnchor="middle" className="pointer-events-none fill-slate-900 text-[7px] font-extrabold dark:fill-white">DRAG CORE</text>
+              </svg>
+              
+              <div className="absolute bottom-2 left-2 right-2 flex justify-between bg-white/90 px-3 py-1.5 rounded border border-slate-200/50 text-[10px] text-slate-800 font-bold select-none backdrop-blur-sm">
+                <span>Amine-Asp: <strong>{dAmine.toFixed(2)} Å</strong></span>
+                <span>Hydroxyl-His: <strong>{dHydroxyl.toFixed(2)} Å</strong></span>
+                <span>Phenyl-Phe: <strong>{dPhenyl.toFixed(2)} Å</strong></span>
+              </div>
+            </div>
+
+            {/* Fallback Position Sliders for fine-tuning & accessibility */}
+            <div className="w-full mt-4 grid grid-cols-2 gap-4">
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs font-bold text-slate-800">
+                  <label htmlFor="ligand-core-x">Ligand Core X Offset</label>
+                  <output htmlFor="ligand-core-x">{ligandPos.x.toFixed(0)}</output>
+                </div>
+                <input 
+                  id="ligand-core-x"
+                  type="range"
+                  min="70"
+                  max="190"
+                  value={ligandPos.x}
+                  onChange={(e) => setLigandPos({ ...ligandPos, x: parseInt(e.target.value) })}
+                  className="w-full h-1 bg-slate-200 rounded appearance-none cursor-pointer accent-slate-900"
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs font-bold text-slate-800">
+                  <label htmlFor="ligand-core-y">Ligand Core Y Offset</label>
+                  <output htmlFor="ligand-core-y">{ligandPos.y.toFixed(0)}</output>
+                </div>
+                <input 
+                  id="ligand-core-y"
+                  type="range"
+                  min="50"
+                  max="150"
+                  value={ligandPos.y}
+                  onChange={(e) => setLigandPos({ ...ligandPos, y: parseInt(e.target.value) })}
+                  className="w-full h-1 bg-slate-200 rounded appearance-none cursor-pointer accent-slate-900"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Thermodynamic Calculations Panel */}
+          <div className="lg:col-span-5 flex flex-col justify-between space-y-4">
+            
+            {/* Thermodynamic Parameters List */}
+            <div className="space-y-3.5">
+              <h4 className="font-extrabold text-sm uppercase tracking-wider text-slate-900 border-b pb-1.5 border-slate-200">
+                Thermodynamic Calculations
+              </h4>
+              
+              <div className="space-y-2.5 text-xs">
+                {/* Salt Bridge readout */}
+                <div className="flex justify-between items-center py-0.5">
+                  <span className="font-semibold text-slate-800">1. Salt Bridge (Amine ⋯ Asp189)</span>
+                  <span className={`font-mono font-bold ${clashAmine ? "text-red-700" : eAmine < -2.0 ? "text-emerald-700" : "text-slate-800"}`}>
+                    {clashAmine ? "Steric Clash! (+15.0)" : `${eAmine.toFixed(2)} kcal/mol`}
+                  </span>
+                </div>
+
+                {/* H-Bond readout */}
+                <div className="flex justify-between items-center py-0.5">
+                  <span className="font-semibold text-slate-800">2. Hydrogen Bond (OH ⋯ His41)</span>
+                  <span className={`font-mono font-bold ${clashHydroxyl ? "text-red-700" : eHydroxyl < -1.5 ? "text-emerald-700" : "text-slate-800"}`}>
+                    {clashHydroxyl ? "Steric Clash! (+12.0)" : `${eHydroxyl.toFixed(2)} kcal/mol`}
+                  </span>
+                </div>
+
+                {/* Stacking readout */}
+                <div className="flex justify-between items-center py-0.5">
+                  <span className="font-semibold text-slate-800">3. π-π Stacking (Phenyl ⋯ Phe140)</span>
+                  <span className={`font-mono font-bold ${clashPhenyl ? "text-red-700" : ePhenyl < -0.8 ? "text-emerald-700" : "text-slate-800"}`}>
+                    {clashPhenyl ? "Steric Clash! (+10.0)" : `${ePhenyl.toFixed(2)} kcal/mol`}
+                  </span>
+                </div>
+
+                {/* Enthalpy dH sum */}
+                <div className="flex justify-between items-center bg-slate-50 p-2 rounded border border-slate-200 font-bold text-slate-900">
+                  <span>Net Enthalpy Change (ΔH)</span>
+                  <span className="font-mono">{clashAmine || clashHydroxyl || clashPhenyl ? "Steric Strain (High)" : `${dH.toFixed(2)} kcal/mol`}</span>
+                </div>
+
+                {/* Conformational Entropy cost */}
+                <div className="flex justify-between items-center py-0.5">
+                  <span className="font-semibold text-slate-800">4. Conformational Entropy Cost (-TΔS_conf)</span>
+                  <span className="font-mono font-bold text-red-600">+{dSconf.toFixed(2)} kcal/mol</span>
+                </div>
+
+                {/* Desolvation entropy boost */}
+                <div className="flex justify-between items-center py-0.5">
+                  <span className="font-semibold text-slate-800">5. Hydrophobic Desolvation (-TΔS_desolv)</span>
+                  <span className={`font-mono font-bold ${dSdesolv < -0.5 ? "text-emerald-700" : "text-slate-800"}`}>
+                    {dSdesolv.toFixed(2)} kcal/mol
+                  </span>
+                </div>
+
+                {/* Net Entropy Change */}
+                <div className="flex justify-between items-center bg-slate-50 p-2 rounded border border-slate-200 font-bold text-slate-900">
+                  <span>Net Entropy Contribution (-TΔS)</span>
+                  <span className="font-mono">{totalTdS.toFixed(2)} kcal/mol</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Final Outcome Panel */}
+            <div className="bg-slate-900 text-white p-4 rounded-xl space-y-2">
+              <div className="flex justify-between items-center">
+                <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400">Gibbs Free Energy</span>
+                <span className={`text-base font-black tracking-wide font-mono ${hasClash ? "text-red-400" : dG < -3.0 ? "text-emerald-400" : "text-slate-200"}`}>
+                  {hasClash ? "STERIC CLASH" : `${dG.toFixed(2)} kcal/mol`}
+                </span>
+              </div>
+              <div className="flex justify-between items-center border-t border-slate-800 pt-2">
+                <span className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400">Binding Constant (K_d)</span>
+                <span className={`text-base font-black font-mono ${hasClash ? "text-red-400" : dG < -4.0 ? "text-emerald-400" : "text-slate-200"}`}>
+                  {getKdText(dG)}
+                </span>
+              </div>
+              
+              <div className="text-[11px] leading-relaxed text-slate-300 font-medium pt-1.5 border-t border-slate-800">
+                {hasClash ? (
+                  <span className="text-red-400 font-bold">WARNING: Steric strain prevents complex formation. Pull ligand core away from the clashing residues.</span>
+                ) : dG < -6.0 ? (
+                  <span className="text-emerald-400 font-bold">SUCCESS: Excellent complementarity! High affinity binding (nM/pM). You have formed robust ionic, hydrogen, and aromatic interactions!</span>
+                ) : dG < -2.0 ? (
+                  <span className="text-amber-400 font-semibold">MODERATE BINDING: The interactions compensate for the rotational entropy penalty, but adjusting core position could optimize the fit.</span>
+                ) : (
+                  <span>NO BINDING: The chemical groups are too far to form robust contacts or have not overcome the entropy barrier.</span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Section 5: Where this model breaks */}
+      <section className="space-y-4">
+        <h2>5. Where This Picture Breaks Down</h2>
+        <p>
+          Everything above treats binding as a sum of pairwise contacts between a ligand and a rigid pocket. That picture is useful enough to design drugs with, and wrong in four specific ways that resurface throughout the course.
+        </p>
+
+        <div className="space-y-3 not-prose">
+          <div className="p-4 rounded-lg border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">Interactions are not additive</h4>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              Adding a hydrogen bond worth 2 kcal/mol to a ligand rarely buys 2 kcal/mol of affinity. The new contact may cost desolvation, restrict a rotatable bond, or strain the pose. Non-additivity is precisely why medicinal chemistry still requires synthesis rather than arithmetic — and why scoring functions (Module 6) fail in the way they do.
+            </p>
+          </div>
+          <div className="p-4 rounded-lg border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">The pocket is not rigid</h4>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              Induced fit above is a cartoon of a much larger effect: side chains rotate, loops close, and some pockets do not exist until a ligand arrives. Anything computed on one fixed structure inherits that structure&apos;s assumptions (Modules 6 and 10).
+            </p>
+          </div>
+          <div className="p-4 rounded-lg border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">Water is a participant, not a background</h4>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              Every contact you form must first break a contact with water, and a few ordered waters in a pocket can be worth more than a whole substituent. Desolvation is the single most commonly underestimated term in this module.
+            </p>
+          </div>
+          <div className="p-4 rounded-lg border border-border bg-white space-y-1.5">
+            <h4 className="font-bold text-sm text-slate-900">Affinity is not the objective</h4>
+            <p className="text-sm text-slate-800 leading-relaxed">
+              ΔG tells you how tightly a ligand binds its target — not whether it is selective, absorbed, metabolically stable, or safe. Ligand efficiency and LLE exist to keep potency honest, and Modules 12 and 15 supply the constraints that ultimately decide whether a tight binder becomes a drug.
+            </p>
+          </div>
+        </div>
+
+        <p className="text-sm text-slate-700">
+          Every one of these is a physical shortcoming of the pairwise model, and each is the reason a later technique exists. Module 4 turns these same interactions into computable energy terms; keep the four caveats in mind, because they explain most of what goes wrong afterwards.
+        </p>
+      </section>
+
+      {/* Quiz Section */}
+      <hr className="border-slate-200 my-8" />
+      <section className="space-y-5">
+        <h2>Knowledge check</h2>
+        <Quiz 
+          moduleTitle="Module 3: Fundamentals of Ligand-Receptor Interactions"
+          questions={[
+            {
+              question: "Why does locking a highly flexible ligand into its binding site cost entropy?",
+              options: [
+                "Because the water molecules surrounding the ligand become more ordered.",
+                "Because free rotations around single bonds are frozen upon complex formation, reducing the ligand's conformational degrees of freedom.",
+                "Because the binding site undergoes a conformational transition to the induced-fit state.",
+                "Because the ligand is forced to form electrostatic salt bridges."
+              ],
+              correctIndex: 1,
+              explanation: "Free ligand molecules in solution have high conformational entropy due to rotation about single bonds. When the ligand binds to the receptor, these rotational bonds are locked into a single active conformation. Freezing these degrees of freedom costs conformational entropy, which acts as a thermodynamic barrier (+TΔS penalty) to binding."
+            },
+            {
+              question: "How does the hydrophobic effect drive ligand binding thermodynamically?",
+              options: [
+                "By changing solvent organization when nonpolar surfaces are buried, which can release constrained interfacial water into bulk solution.",
+                "By forming strong hydrogen bonds between the ligand's non-polar groups and target water molecules.",
+                "By increasing the enthalpy of the system through hydrophobic dipole interactions.",
+                "By rigidifying target side chains to lower conformational entropy barriers."
+              ],
+              correctIndex: 0,
+              explanation: "Burying nonpolar surfaces changes the solvent-exposed area and the organization of nearby water. Releasing constrained interfacial waters can provide a favorable entropic contribution, but the magnitude depends on the local water network and pocket environment."
+            },
+            {
+              question: "What does lipophilic ligand efficiency help reveal within a related series?",
+              options: [
+                "Whether potency is improving faster than lipophilicity",
+                "Whether a protein contains alpha helices",
+                "The exact binding pose",
+                "The number of crystallographic waters"
+              ],
+              correctIndex: 0,
+              explanation: "LLE or LipE relates pActivity to logD or logP. It helps detect potency gains that mainly come from adding lipophilicity, but the assay endpoint and lipophilicity convention must be consistent."
+            },
+            {
+              question: "Why should an apparently favorable binding enthalpy not be optimized in isolation?",
+              options: [
+                "Enthalpy cannot be measured",
+                "Affinity also reflects entropy, solvent, protonation, and conformational changes",
+                "Only molecular weight affects affinity",
+                "A favorable enthalpy always means lower selectivity"
+              ],
+              correctIndex: 1,
+              explanation: "Binding terms are coupled. Enthalpy-entropy compensation and experimental conditions can produce similar affinity from different profiles, so the full evidence panel matters."
+            }
+          ]}
+        />
+      </section>
+    </div>
+  );
+}
